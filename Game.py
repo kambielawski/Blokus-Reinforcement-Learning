@@ -43,6 +43,9 @@ class Game():
     # run() - runs a whole game on board
     # verbose - specifies whether the board and piecelists are printed before each turn
     def run(self, verbose = True):
+
+        all_moves, moves = self.enumerate_current_moves()
+        print('all moves: ', all_moves, 'moves: ', moves)
         
         # Ends game if no player can make a move
         turns_since_last_move = 0
@@ -55,16 +58,16 @@ class Game():
                 #print(self.player_list[2].played)
                 #print(self.player_list[3].played)
                 print("\n\n")
-                self.game_board.display2()
+                #self.game_board.display2()
             
             # select player to play
             current_player = self.player_list[self.turn-1]
             
             # ask player to make move (this function updates player and self.board)
             if self.turn == 1:
-                move = current_player.make_move(self.game_board,self.pieces, 'space_heuristic')
+                move = current_player.make_move(self.game_board,self.pieces, 'random')
             elif self.turn == 2:
-                move = current_player.make_move(self.game_board,self.pieces, 'space_heuristic2')
+                move = current_player.make_move(self.game_board,self.pieces, 'random')
             else:
                 move = current_player.make_move(self.game_board,self.pieces, 'random')
             
@@ -85,6 +88,7 @@ class Game():
             # change to next player
             self.turn = self.turn % len(self.player_list) + 1
 
+        self.game_board.display2()
         return self.score()
     
     # score() - scores game based on number of squares occupied on board by players
@@ -100,6 +104,7 @@ class Game():
         """
         # get all valid moves
         player = self.player_list[self.turn-1]
+        print(self.pieces)
         moves = player.make_move(self.game_board,self.pieces,"random",return_all = True)
         
         all_moves = []
@@ -127,6 +132,16 @@ class Game():
         # change to next player
         self.turn = self.turn % len(self.player_list) + 1
 
+def num_to_player(num):
+    if num == 0:
+        return 'blue'
+    elif num == 1:
+        return 'red'
+    elif num == 2:
+        return 'green'
+    else:
+        return 'yellow'
+
 if __name__ == "__main__":
     # start of body text, used to verify code was working        
     random.seed(3)
@@ -134,3 +149,6 @@ if __name__ == "__main__":
     #os.chdir("C:/Users/Mike/Documents/Coding Projects/Blokus/Dereks/Blokus-Reinforcement-Learning")
     game = Game(5,4,20)
     final_score = game.run()
+    print(final_score)
+    print(final_score.index(max(final_score))+1, ' wins!')
+
