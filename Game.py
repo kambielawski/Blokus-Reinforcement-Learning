@@ -25,11 +25,13 @@ class Game():
         f = open('blokus_pieces_lim_5.pkl', 'rb')
         all_pieces = pickle.load(f)
         f.close()
+        print(len(all_pieces))
         
         self.pieces = []
         for piece in all_pieces:
             # TODO: Piece size other than 5 doesn't work                                                        
             if piece.size <= piece_size:
+                # self.pieces includes all orientations
                 self.pieces.append(piece.get_orientations())
                
         self.player_list = []
@@ -58,7 +60,7 @@ class Game():
                 #print(self.player_list[2].played)
                 #print(self.player_list[3].played)
                 print("\n\n")
-                #self.game_board.display2()
+                self.game_board.display2()
             
             # select player to play
             current_player = self.player_list[self.turn-1]
@@ -80,10 +82,10 @@ class Game():
             
             # eventually, log each move
             
-                # end game if a player has played all pieces
-                for player in self.player_list:
-                    if np.prod(player.played) == 1:
-                        turns_since_last_move = len(self.player_list)
+            # end game if a player has played all pieces
+            for player in self.player_list:
+                if np.prod(player.played) == 1:
+                    turns_since_last_move = len(self.player_list)
             
             # change to next player
             self.turn = self.turn % len(self.player_list) + 1

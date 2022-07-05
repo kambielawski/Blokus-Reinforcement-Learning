@@ -3,6 +3,7 @@ import pygame
 import numpy as np
 from gym import spaces
 
+from Game import Game
 
 class BlokusEnv(gym.Env):
     def __init__(self):
@@ -18,24 +19,34 @@ class BlokusEnv(gym.Env):
             # orientation? 
         })
         '''
-        self.action_space = spaces.Tuple(
+        self.action_space = spaces.Tuple((
             spaces.Discrete(1),  # ? 
             spaces.Discrete(21), # piece number
             spaces.Discrete(4),  # piece orientation 
-            spaces.Tuple(spaces.Discrete(3), spaces.Discrete(3)), # piece flip axes
-        )
+            spaces.Tuple((spaces.Discrete(3), spaces.Discrete(3))), # piece flip axes
+        ))
 
         # display variables
         self.window = None
 
-    def step(self, action):
-        pass
+    def reset(self, seed=None, return_info=False, options=None):
+        super().reset(seed=seed)
+
+        # initialize new game
+        self.game = Game(5,4,20)
 
     def display(self):
         pass
 
-    def reset(self):
-        pass
+    def step(self, action):
+        observation = 0
+        reward = 0
+        done = 0
+        info = 0
+        return observation, reward, done, info
+
+    def render(self):
+        self.game.game_board.display2()
 
     def close(self):
         if self.window is not None:
