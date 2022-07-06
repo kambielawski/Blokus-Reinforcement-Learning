@@ -2,6 +2,7 @@ from Piece import Piece
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+import pygame
 
 # Board - maintains representation of game board
 # self.board- a numpy array representation of the board, with a 0 representing
@@ -14,6 +15,16 @@ class Board:
     def __init__(self,size):
         self.board = np.zeros([size,size])
         self.size = size
+        self.num_to_color = { 0: (255,255,255),
+                              1: (255,255,0),
+                              2: (0,0,255),
+                              3: (255,0,0),
+                              4: (0,255,0) }
+        # pygame render parameters
+        self.clock = None
+        self.window = None
+        self.window_size = 512
+
     #check_valid_move() - returns True if move is valid for current board state, False otherwise
     # player - int from 1 to number of players
     # piece - translated Piece object
@@ -72,6 +83,54 @@ class Board:
         plt.show()
         plt.pause(0.01)
         
+    def display_pygame(self):
+        if self.window is None:
+            pygame.init()
+            pygame.display.init()
+            self.window = pygame.display.set_mode((self.window_size, self.window_size))
+        
+        if self.clock is None:
+            self.clock = pygame.time.Clock()
+
+        canvas = pygame.Surface((self.window_size, self.window_size))
+        canvas.fill((255,255,255))
+        square_size = (self.window_size / self.size)
+        
+        # draw gridlines
+        for x in range(self.size):
+            pygame.draw.line(
+                canvas,
+                0,
+                (0, square_size * x),
+                (self.window_size, square_size * x),
+                width=3
+            )
+            pygame.draw.line(
+                canvas,
+                0,
+                (square_size * x, 0),
+                (square_size * x, self.window_size),
+                width=3
+            )
+
+        # draw pieces
+        for i in range(self.size):
+            for j in range(self.size):
+                if self.board[i][j] > 0:
+                    pygame.draw.rect(
+                        canvas,
+                        self.num_to_color[self.board[i][j]],
+                        pygame.Rect(
+                            (square_size * i, square_size * j),
+                            (square_size, square_size)
+                        )
+                    )
+
+        self.window.blit(canvas, canvas.get_rect())
+        pygame.event.pump()
+        pygame.display.update()
+        self.clock.tick(30)
+
     # play_piece() - update board with player's piece if valid
     # player - int from 1 to number of players
     # piece - translated Piece object

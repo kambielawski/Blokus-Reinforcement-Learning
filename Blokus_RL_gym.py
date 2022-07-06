@@ -16,4 +16,4 @@ for _ in range(1):
     if done:
         env.reset()
     
-env.close()
+# env.close()

@@ -60,7 +60,8 @@ class Game():
                 #print(self.player_list[2].played)
                 #print(self.player_list[3].played)
                 print("\n\n")
-                self.game_board.display2()
+                self.game_board.display_pygame()
+                # self.game_board.display2()
             
             # select player to play
             current_player = self.player_list[self.turn-1]
@@ -90,7 +91,7 @@ class Game():
             # change to next player
             self.turn = self.turn % len(self.player_list) + 1
 
-        self.game_board.display2()
+        # self.game_board.display2()
         return self.score()
     
     # score() - scores game based on number of squares occupied on board by players

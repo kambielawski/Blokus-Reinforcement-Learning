@@ -28,15 +28,13 @@ class BlokusEnv(gym.Env):
 
         # display variables
         self.window = None
+        self.window_size = 512
 
     def reset(self, seed=None, return_info=False, options=None):
         super().reset(seed=seed)
 
         # initialize new game
         self.game = Game(5,4,20)
-
-    def display(self):
-        pass
 
     def step(self, action):
         observation = 0
@@ -46,7 +44,7 @@ class BlokusEnv(gym.Env):
         return observation, reward, done, info
 
     def render(self):
-        self.game.game_board.display2()
+        self.game.game_board.display_pygame()
 
     def close(self):
         if self.window is not None:
