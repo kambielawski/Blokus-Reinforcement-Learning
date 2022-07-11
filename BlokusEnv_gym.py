@@ -19,6 +19,9 @@ class BlokusEnv(gym.Env):
             # orientation? 
         })
         '''
+        # self-play wrapper only handles Discrete action spaces;
+        # could either fork the self-play wrapper and implement Tuple action spaces
+        # or convert below into a Discrete action space
         self.action_space = spaces.Tuple((
             spaces.Discrete(1),  # ? 
             spaces.Discrete(21), # piece number
@@ -44,6 +47,7 @@ class BlokusEnv(gym.Env):
         return observation, reward, done, info
 
     def render(self):
+        # self.game.game_board.display2()
         self.game.game_board.display_pygame()
 
     def close(self):

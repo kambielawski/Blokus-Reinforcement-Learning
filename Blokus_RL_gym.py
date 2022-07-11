@@ -1,3 +1,4 @@
+import os
 import gym
 import numpy as np
 from BlokusEnv_gym import BlokusEnv
@@ -10,7 +11,10 @@ for _ in range(1):
     action = {1:1}
 
     # advance the game
-    observation, reward, done, info = env.step(action) # pass action into step()
+    # pass action into step()
+    observation, reward, done, info = env.step(action) 
+
+    # render the game
     env.render()
 
     if done:
