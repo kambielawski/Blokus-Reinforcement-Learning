@@ -29,6 +29,10 @@ class BlokusEnv(gym.Env):
             spaces.Tuple((spaces.Discrete(3), spaces.Discrete(3))), # piece flip axes
         ))
 
+        # variables for self-play wrapper
+        self.n_players = 2
+        self.current_player_num = 1
+
         # display variables
         self.window = None
         self.window_size = 512
@@ -44,7 +48,28 @@ class BlokusEnv(gym.Env):
         reward = 0
         done = 0
         info = 0
+
         return observation, reward, done, info
+
+    '''
+    The observation function returns a numpy array that can be fed as input 
+    to the PPO policy network. It should return a numeric representation of 
+    the current game state, from the perspective of the current player, 
+    where each element of the array is in the range [-1,1].
+    '''
+    def observation(self):
+        pass
+
+    '''
+    The legal_actions function returns a numpy vector of the same length 
+    as the action space, where 1 indicates that the action is valid and 0 
+    indicates that the action is invalid.
+    '''
+    def legal_actions(self):
+        pass
+
+    def pause(self):
+        pygame.time.wait(1000)
 
     def render(self):
         # self.game.game_board.display2()

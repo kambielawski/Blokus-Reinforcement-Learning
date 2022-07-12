@@ -6,7 +6,7 @@ from BlokusEnv_gym import BlokusEnv
 env = BlokusEnv()
 env.reset()
 
-for _ in range(1):
+for _ in range(5):
     # generate an action using RL agent 
     action = {1:1}
 
@@ -18,6 +18,7 @@ for _ in range(1):
     env.render()
 
     if done:
+        env.pause()
         env.reset()
     
 # env.close()
