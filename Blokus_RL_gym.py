@@ -1,14 +1,16 @@
-import os
 import gym
+import random
 import numpy as np
 from BlokusEnv_gym import BlokusEnv
 
 env = BlokusEnv()
 env.reset()
 
-for _ in range(5):
+NUM_GAMES = 2
+while NUM_GAMES > 0:
     # generate an action using RL agent 
     action = {1:1}
+    random.seed()
 
     # advance the game
     # pass action into step()
@@ -18,7 +20,8 @@ for _ in range(5):
     env.render()
 
     if done:
-        env.pause()
+        NUM_GAMES -= 1
         env.reset()
-    
-# env.close()
+
+env.pause()
+env.close()

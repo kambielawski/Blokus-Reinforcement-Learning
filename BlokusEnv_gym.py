@@ -46,8 +46,10 @@ class BlokusEnv(gym.Env):
     def step(self, action):
         observation = 0
         reward = 0
-        done = 0
         info = 0
+
+        # Run one iteration of the game
+        done = self.game.step()
 
         return observation, reward, done, info
 
@@ -69,10 +71,9 @@ class BlokusEnv(gym.Env):
         pass
 
     def pause(self):
-        pygame.time.wait(1000)
+        pygame.time.wait(10000)
 
     def render(self):
-        # self.game.game_board.display2()
         self.game.game_board.display_pygame()
 
     def close(self):
