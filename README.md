@@ -1,3 +1,8 @@
+# Kam's Fork
+
+I forked DerekGloudemans's [Blokus RL repo](https://github.com/DerekGloudemans/Blokus-Reinforcement-Learning) and I'm using davidADSP's [SIMPLE](https://github.com/davidADSP/SIMPLE) self-play RL wrapper to build an AI to beat my brother at the game [Blokus](https://en.wikipedia.org/wiki/Blokus).
+
+# === Original DerekGloudemans' README ===
 # Blokus-Reinforcement-Learning
 ![](readme_ims/34.png)
 
