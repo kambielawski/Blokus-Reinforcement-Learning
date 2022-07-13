@@ -3,7 +3,7 @@ import pygame
 import numpy as np
 from gym import spaces
 
-from Game import Game
+from Blokus import Blokus
 
 class BlokusEnv(gym.Env):
     def __init__(self):
@@ -26,7 +26,7 @@ class BlokusEnv(gym.Env):
         super().reset(seed=seed)
 
         # initialize new game
-        self.game = Game(5,4,20)
+        self.game = Blokus(5,4,20)
 
     def step(self, action):
         observation = 0

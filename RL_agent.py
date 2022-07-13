@@ -1,7 +1,7 @@
 from Piece import Piece
 from Board import Board
 from Player import Player
-from Game import Game
+from Blokus import Blokus
 import numpy as np
 import pickle
 import random
@@ -170,7 +170,7 @@ def play_game(model):
     """
     Plays agent against benchmarking heuristic algorithm and random algorithm
     """
-    game = Game(5,2,10)
+    game = Blokus(5,2,10)
     
     turns_since_last_move = 0
     while turns_since_last_move < 2:
@@ -360,7 +360,7 @@ if __name__ == "__main__":
     bs = 8
     all_losses = deque(maxlen = 500)
     step = 0
-    game = Game(5,2,bs)
+    game = Blokus(5,2,bs)
     neither = False
     
     
@@ -410,7 +410,7 @@ if __name__ == "__main__":
                 #### Add lines to keep track of whether neither player can move, or just a single player
                 if neither:
                     #game.game_board.display2()
-                    game = Game(5,2,bs)
+                    game = Blokus(5,2,bs)
                     neither = False
                 else:
                     # switch turns and indicate that if it happens again, the game is over as neither can move

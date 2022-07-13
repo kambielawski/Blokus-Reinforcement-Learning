@@ -12,7 +12,7 @@ import copy
     # for one piece, stored as a list of Piece objects (common to all players, not modified during play)
 # self.player_list - list of 4 Player objects, where entry i corresponds to player (i+1)
 # self.turn - integer from 1 to number of players, keeping track of which player is next to go
-class Game():
+class Blokus():
     
     # Constructor
     # piece_size - int, maximum number of squares occupied by one piece (5)
@@ -102,6 +102,11 @@ class Game():
             scores.append(sum(sum(self.game_board.board == i+1)))    
         return scores
 
+    def num_possible_moves(self):
+        player = self.player_list[self.turn-1]
+        moves = player.make_move(self.game_board,self.pieces,"random",return_all = True)
+        return len(moves)
+
     def enumerate_current_moves(self):
         """
         Returns current player idx and all possible moves (as board states) for that player
@@ -150,7 +155,7 @@ if __name__ == "__main__":
     random.seed(3)
     #import os
     #os.chdir("C:/Users/Mike/Documents/Coding Projects/Blokus/Dereks/Blokus-Reinforcement-Learning")
-    game = Game(5,4,20)
+    game = Blokus(5,4,20)
     final_score = game.run()
     print(final_score)
     print(num_to_player(final_score.index(max(final_score))), ' wins!')
