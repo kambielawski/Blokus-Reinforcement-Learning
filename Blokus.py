@@ -86,10 +86,7 @@ class Blokus():
             if verbose:
                 print(self.turn)
                 #self.game_board.display2()
-                print(self.player_list[0].played)
-                print(self.player_list[1].played)
-                #print(self.player_list[2].played)
-                #print(self.player_list[3].played)
+                print(self.get_canonical_board())
                 print("\n\n")
                 self.game_board.display_pygame()
 
@@ -125,6 +122,17 @@ class Blokus():
             all_moves.append(temp_board)
             
         return all_moves,moves
+
+    def get_canonical_board(self):
+        cboard = self.game_board.board
+        cboard = np.where(cboard == 1, 1, cboard)
+        cboard = np.where(cboard == 2, -0.5, cboard)
+        cboard = np.where(cboard == 3, 0.5, cboard)
+        cboard = np.where(cboard == 4, -1, cboard)
+        if self.turn == 1 or self.turn == 3:
+            return cboard
+        else:
+            return -cboard
      
     def make_move(self,move):
         """
@@ -141,11 +149,11 @@ class Blokus():
         self.turn = self.turn % len(self.player_list) + 1
 
 def num_to_player(num):
-    if num == 0:
+    if num == 1:
         return 'blue'
-    elif num == 1:
-        return 'red'
     elif num == 2:
+        return 'red'
+    elif num == 3:
         return 'green'
     else:
         return 'yellow'
