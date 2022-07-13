@@ -6,11 +6,12 @@ from BlokusEnv_gym import BlokusEnv
 env = BlokusEnv()
 env.reset()
 
-NUM_GAMES = 2
+NUM_GAMES = 1
 while NUM_GAMES > 0:
-    # generate an action using RL agent 
-    action = {1:1}
     random.seed()
+
+    # generate an action using RL agent 
+    action = env.action_space.sample()
 
     # advance the game
     # pass action into step()

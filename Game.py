@@ -27,7 +27,6 @@ class Game():
         f = open('blokus_pieces_lim_5.pkl', 'rb')
         all_pieces = pickle.load(f)
         f.close()
-        print(len(all_pieces))
         
         self.pieces = []
         for piece in all_pieces:
@@ -109,7 +108,6 @@ class Game():
         """
         # get all valid moves
         player = self.player_list[self.turn-1]
-        print(self.pieces)
         moves = player.make_move(self.game_board,self.pieces,"random",return_all = True)
         
         all_moves = []

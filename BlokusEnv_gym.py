@@ -11,27 +11,12 @@ class BlokusEnv(gym.Env):
         self.observation_space = spaces.Box(low=0, high=3, shape=(20,20), dtype=int)
 
         # representation of RL agent's possible moves
-        '''
-        self.action_space = spaces.Dict({
-            "acting_player": spaces.MultiBinary(1), # 0 or 1 to identify player
-            "piece": ,
-            "position": ,
-            # orientation? 
-        })
-        '''
-        # self-play wrapper only handles Discrete action spaces;
-        # could either fork the self-play wrapper and implement Tuple action spaces
-        # or convert below into a Discrete action space
         self.action_space = spaces.Tuple((
-            spaces.Discrete(1),  # ? 
+            spaces.Discrete(4),  # player/color number
             spaces.Discrete(21), # piece number
-            spaces.Discrete(4),  # piece orientation 
-            spaces.Tuple((spaces.Discrete(3), spaces.Discrete(3))), # piece flip axes
+            spaces.Discrete(8),  # piece orientation 
+            spaces.Tuple((spaces.Discrete(20), spaces.Discrete(20))), # piece location
         ))
-
-        # variables for self-play wrapper
-        self.n_players = 2
-        self.current_player_num = 1
 
         # display variables
         self.window = None
@@ -52,23 +37,6 @@ class BlokusEnv(gym.Env):
         done = self.game.step()
 
         return observation, reward, done, info
-
-    '''
-    The observation function returns a numpy array that can be fed as input 
-    to the PPO policy network. It should return a numeric representation of 
-    the current game state, from the perspective of the current player, 
-    where each element of the array is in the range [-1,1].
-    '''
-    def observation(self):
-        pass
-
-    '''
-    The legal_actions function returns a numpy vector of the same length 
-    as the action space, where 1 indicates that the action is valid and 0 
-    indicates that the action is invalid.
-    '''
-    def legal_actions(self):
-        pass
 
     def pause(self):
         pygame.time.wait(10000)
