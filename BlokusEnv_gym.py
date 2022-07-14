@@ -4,6 +4,7 @@ import numpy as np
 from gym import spaces
 
 from Blokus import Blokus
+from DisplayEngine import DisplayEngine
 
 class BlokusEnv(gym.Env):
     def __init__(self):
@@ -18,9 +19,7 @@ class BlokusEnv(gym.Env):
             spaces.Tuple((spaces.Discrete(20), spaces.Discrete(20))), # piece location
         ))
 
-        # display variables
-        self.window = None
-        self.window_size = 512
+        self.display = DisplayEngine()
 
     def reset(self, seed=None, return_info=False, options=None):
         super().reset(seed=seed)
@@ -34,18 +33,17 @@ class BlokusEnv(gym.Env):
         info = 0
 
         # Run one iteration of the game
-        done = self.game.step()
+        done = self.game.step(action)
 
         return observation, reward, done, info
 
     def pause(self):
-        pygame.time.wait(10000)
+        self.display.pause()
 
     def render(self):
-        self.game.game_board.display_pygame()
+        self.display.update(self.game.game_board)
+        # self.game.game_board.display_pygame()
 
     def close(self):
-        if self.window is not None:
-            pygame.display.quit()
-            pygame.quit()
+        self.display.end()
 

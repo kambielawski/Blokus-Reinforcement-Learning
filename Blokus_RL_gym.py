@@ -1,4 +1,3 @@
-import gym
 import random
 import numpy as np
 
@@ -18,20 +17,25 @@ NUM_GAMES = 1
 while NUM_GAMES > 0:
     random.seed()
 
-    # generate an action using RL agent 
-    action = env.action_space.sample()
-    # action = mcts.selectAction(env.game.getCanonicalBoard())
+    # maximize piece size heuristic
+    valid_moves = env.game.get_valid_moves()
+    # action_probs, _ = mcts.heuristic(valid_moves)
+    # action = np.random.choice(len(action_probs), p=action_probs)
+
+    # generate an action using MCTS
+    action = mcts.selectAction(env.game)
 
     # advance the game
     # pass action into step()
-    observation, reward, done, info = env.step(action) 
+    observation, reward, done, info = env.step(valid_moves[action]) 
 
-    # render the game
+    # render the board
     env.render()
 
     if done:
         NUM_GAMES -= 1
         env.reset()
+        mcts = MCTS(env.game, None, args) # reset search tree
 
 env.pause()
 env.close()
