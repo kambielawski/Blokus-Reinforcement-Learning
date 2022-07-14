@@ -1,5 +1,6 @@
 import logging
 import math
+import copy
 
 import numpy as np
 
@@ -25,13 +26,14 @@ class MCTS():
         self.Es = {}  # stores game.getGameEnded ended for board s
         self.Vs = {}  # stores game.getValidMoves for board s
 
-    def selectAction(self, canonicalBoard):
-        action_probs = self.getActionProb(canonicalBoard)
-        action = action_probs.index(max(action_probs))
-        # action = np.random.choice(len(action_probs), p=action_probs)
+    def selectAction(self, game):
+        action_probs = self.getActionProb(game)
+        print(action_probs)
+        # action = action_probs.index(max(action_probs))
+        action = np.random.choice(len(action_probs), p=action_probs)
         return action
 
-    def getActionProb(self, canonicalBoard, temp=1):
+    def getActionProb(self, game, temp=1):
         """
         This function performs numMCTSSims simulations of MCTS starting from
         canonicalBoard.
@@ -40,14 +42,16 @@ class MCTS():
             probs: a policy vector where the probability of the ith action is
                    proportional to Nsa[(s,a)]**(1./temp)
         """
-        for _ in range(self.args.numMCTSSims):
-            self.search(canonicalBoard)
+        print("Searching for move...")
+        for _ in range(self.args['numMCTSSims']):
+            self.search(game)
 
-        s = self.game.stringRepresentation(canonicalBoard)
-        counts = [self.Nsa[(s, a)] if (s, a) in self.Nsa else 0 for a in range(self.game.getActionSize())]
+        s = game.get_string_representation()
+        counts = [self.Nsa[(s, a)] if (s, a) in self.Nsa else 0 for a in range(game.num_possible_moves())]
 
         if temp == 0:
             bestAs = np.array(np.argwhere(counts == np.max(counts))).flatten()
+            # choose among equally best actions
             bestA = np.random.choice(bestAs)
             probs = [0] * len(counts)
             probs[bestA] = 1
@@ -58,10 +62,21 @@ class MCTS():
         probs = [x / counts_sum for x in counts]
         return probs
 
-    def heuristic(self, canonicalBoard):
-        return 0, 0
+    # returns: prior action probabilities (between 0 and size(action_space) - 1)
+    #          value (value of the action)
+    def heuristic(self, valid_moves):
+        if len(valid_moves) == 0:
+            print('error: no valid moves left')
+            exit(1)
+        # randomly choose an action that maximizes the size of the piece placed
+        piece_sizes = [self.game.piece_sizes[a[1]] for a in valid_moves]
+        max_pieces = [1 if a == max(piece_sizes) else 0 for a in piece_sizes]
+        # normalize
+        prior_action_probs = [a / sum(max_pieces) for a in max_pieces]
 
-    def search(self, canonicalBoard):
+        return prior_action_probs, max(piece_sizes)
+
+    def search(self, game):
         """
         This function performs one iteration of MCTS. It is recursively called
         till a leaf node is found. The action chosen at each node is one that
@@ -81,19 +96,29 @@ class MCTS():
             v: the negative of the value of the current canonicalBoard
         """
 
-        s = self.game.stringRepresentation(canonicalBoard)
+        s = game.get_string_representation()
 
+        # Check if game has ended given this board
         if s not in self.Es:
-            self.Es[s] = self.game.getGameEnded(canonicalBoard, 1)
+            self.Es[s] = game.get_game_ended()
+
+        # Return -1 if P1&P3 has won, 1 if P2&P4 has won
         if self.Es[s] != 0:
             # terminal node
             return -self.Es[s]
 
-        
+        # leaf node (non-terminal for now)        
         if s not in self.Ps:
-            # leaf node (non-terminal for now)
-            self.Ps[s], v = self.heuristic(canonicalBoard) # self.nnet.predict(canonicalBoard)
-            valids = self.game.getValidMoves(canonicalBoard, 1)
+            valids = game.get_valid_moves(1)
+            self.Ps[s], v = self.heuristic(valids) # self.nnet.predict(canonicalBoard)
+            
+            # eventually this will pass all the board states after the valid moves 
+            # into a neural net to have it return a prior probability for each of 
+            # the moves. 
+
+            # Pretty sure we don't have to worry about this because self.heuristic()
+            # is always valid and normalized
+            '''
             self.Ps[s] = self.Ps[s] * valids  # masking invalid moves
             sum_Ps_s = np.sum(self.Ps[s])
             if sum_Ps_s > 0:
@@ -106,6 +131,7 @@ class MCTS():
                 log.error("All valid moves were masked, doing a workaround.")
                 self.Ps[s] = self.Ps[s] + valids
                 self.Ps[s] /= np.sum(self.Ps[s])
+            '''
 
             self.Vs[s] = valids
             self.Ns[s] = 0
@@ -116,23 +142,25 @@ class MCTS():
         best_act = -1
 
         # pick the action with the highest upper confidence bound
-        for a in range(self.game.getActionSize()):
-            if valids[a]:
-                if (s, a) in self.Qsa:
-                    u = self.Qsa[(s, a)] + self.args.cpuct * self.Ps[s][a] * math.sqrt(self.Ns[s]) / (
-                            1 + self.Nsa[(s, a)])
-                else:
-                    u = self.args.cpuct * self.Ps[s][a] * math.sqrt(self.Ns[s] + EPS)  # Q = 0 ?
+        for a in range(len(valids)):
+            if (s, a) in self.Qsa:
+                u = self.Qsa[(s, a)] + self.args['cpuct'] * self.Ps[s][a] * math.sqrt(self.Ns[s]) / (
+                        1 + self.Nsa[(s, a)])
+            else:
+                u = self.args['cpuct'] * self.Ps[s][a] * math.sqrt(self.Ns[s] + EPS)  # Q = 0 ?
 
-                if u > cur_best:
-                    cur_best = u
-                    best_act = a
+            if u > cur_best:
+                cur_best = u
+                best_act = a
 
         a = best_act
-        next_s, next_player = self.game.getNextState(canonicalBoard, 1, a)
-        next_s = self.game.getCanonicalForm(next_s, next_player)
+        game_after_move = copy.deepcopy(game)
+        game_after_move.make_move(valids[a])
 
-        v = self.search(next_s)
+        # next_s, next_player = self.game.getNextState(canonicalBoard, 1, a)
+        # next_s = self.game.getCanonicalForm(next_s, next_player)
+
+        v = self.search(game_after_move)
 
         if (s, a) in self.Qsa:
             self.Qsa[(s, a)] = (self.Nsa[(s, a)] * self.Qsa[(s, a)] + v) / (self.Nsa[(s, a)] + 1)

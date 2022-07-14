@@ -23,7 +23,7 @@ class Piece:
         self.corners = self.get_corners()
         self.adjacents = self.get_adjacents()
         self.diag_adjacents = self.get_diag_adjacents()
-    
+
     ### Utility functions for transforming piece
     
     # flip() - flips piece along major diagonal (by reference)

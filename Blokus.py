@@ -34,7 +34,8 @@ class Blokus():
             if piece.size <= piece_size:
                 # self.pieces includes all orientations
                 self.pieces.append(piece.get_orientations())
-               
+        
+        self.piece_sizes = [1,2,3,4,5,3,4,5,5,5,5,5,5,5,5,5,5,5,4,4,4]
         self.player_list = []
         for i in range (1,num_players+1):
             # Note from Mike: I don't think piece_size is a necessary attribute for the Player object
@@ -43,34 +44,37 @@ class Blokus():
             
         self.turn = 1
     
-    def step(self):
+    def step(self, action=None):
         # select player to play
         current_player = self.player_list[self.turn-1]
         
-        # ask player to make move (this function updates player and self.board)
-        if self.turn == 1:
-            move = current_player.make_move(self.game_board,self.pieces, 'random')
-        elif self.turn == 2:
-            move = current_player.make_move(self.game_board,self.pieces, 'random')
-        else:
-            move = current_player.make_move(self.game_board,self.pieces, 'random')
+        if action:
+            self.make_move(action)
+        else: 
+            # ask player to make move (this function updates player and self.board)
+            if self.turn == 1:
+                move = current_player.make_move(self.game_board,self.pieces, 'random')
+            elif self.turn == 2:
+                move = current_player.make_move(self.game_board,self.pieces, 'random')
+            else:
+                move = current_player.make_move(self.game_board,self.pieces, 'random')
+            
+            # if no move could be made, increment counter by 1
+            # else reset counter to 0
+            if  move == False: #no move available
+                self.turns_since_last_move = self.turns_since_last_move + 1
+            else:
+                self.turns_since_last_move = 0
+            
+            # eventually, log each move
+            
+            # end game if a player has played all pieces
+            for player in self.player_list:
+                if np.prod(player.played) == 1:
+                    self.turns_since_last_move = self.n_players
         
-        # if no move could be made, increment counter by 1
-        # else reset counter to 0
-        if  move == False: #no move available
-            self.turns_since_last_move = self.turns_since_last_move + 1
-        else:
-            self.turns_since_last_move = 0
-        
-        # eventually, log each move
-        
-        # end game if a player has played all pieces
-        for player in self.player_list:
-            if np.prod(player.played) == 1:
-                self.turns_since_last_move = self.n_players
-        
-        # change to next player
-        self.turn = self.turn % len(self.player_list) + 1
+            # change to next player
+            self.turn = self.turn % len(self.player_list) + 1
 
         done = self.turns_since_last_move == self.n_players
 
@@ -98,11 +102,35 @@ class Blokus():
         for i in range(0,len(self.player_list)):
             scores.append(sum(sum(self.game_board.board == i+1)))    
         return scores
+    
+    # returns true if all players are out of possible moves
+    def get_game_ended(self):
+        if all([self.num_possible_moves(i) == 0 for i in range(self.n_players)]):
+            scores = self.score()
+            p1_score = scores[0] + scores[2]
+            p2_score = scores[1] + scores[3]
+            if p1_score > p2_score:
+                return -1
+            # TODO: tie goes to p2... ?
+            else:
+                return 1
+        return 0
 
-    def num_possible_moves(self):
-        player = self.player_list[self.turn-1]
+    def num_possible_moves(self, playerNum=None):
+        if not playerNum:
+            playerNum = self.turn
+        player = self.player_list[playerNum-1]
         moves = player.make_move(self.game_board,self.pieces,"random",return_all = True)
         return len(moves)
+
+    # return all valid moves for given player number
+    def get_valid_moves(self, playerNum=None):
+        if not playerNum:
+            playerNum = self.turn
+        player = self.player_list[playerNum-1]
+        # TODO: might be optimizable, we don't need to update moves before returning them
+        moves = player.make_move(self.game_board,self.pieces,"random",return_all = True)
+        return moves
 
     def enumerate_current_moves(self):
         """
@@ -122,17 +150,6 @@ class Blokus():
             all_moves.append(temp_board)
             
         return all_moves,moves
-
-    def get_canonical_board(self):
-        cboard = self.game_board.board
-        cboard = np.where(cboard == 1, 1, cboard)
-        cboard = np.where(cboard == 2, -0.5, cboard)
-        cboard = np.where(cboard == 3, 0.5, cboard)
-        cboard = np.where(cboard == 4, -1, cboard)
-        if self.turn == 1 or self.turn == 3:
-            return cboard
-        else:
-            return -cboard
      
     def make_move(self,move):
         """
@@ -147,6 +164,20 @@ class Blokus():
         
         # change to next player
         self.turn = self.turn % len(self.player_list) + 1
+
+    def get_canonical_board(self):
+        cboard = self.game_board.board
+        cboard = np.where(cboard == 1, 1, cboard)
+        cboard = np.where(cboard == 2, -0.5, cboard)
+        cboard = np.where(cboard == 3, 0.5, cboard)
+        cboard = np.where(cboard == 4, -1, cboard)
+        if self.turn == 1 or self.turn == 3:
+            return cboard
+        else:
+            return -cboard
+
+    def get_string_representation(self):
+        return np.array2string(self.game_board.board)
 
 def num_to_player(num):
     if num == 1:
