@@ -28,7 +28,6 @@ class MCTS():
 
     def selectAction(self, game):
         action_probs = self.getActionProb(game)
-        print(action_probs)
         # action = action_probs.index(max(action_probs))
         action = np.random.choice(len(action_probs), p=action_probs)
         return action
@@ -46,7 +45,7 @@ class MCTS():
         for _ in range(self.args['numMCTSSims']):
             self.search(game)
 
-        s = game.get_string_representation()
+        s = np.array2string(game.get_canonical_board())
         counts = [self.Nsa[(s, a)] if (s, a) in self.Nsa else 0 for a in range(game.num_possible_moves())]
 
         if temp == 0:
@@ -65,9 +64,6 @@ class MCTS():
     # returns: prior action probabilities (between 0 and size(action_space) - 1)
     #          value (value of the action)
     def heuristic(self, valid_moves):
-        if len(valid_moves) == 0:
-            print('error: no valid moves left')
-            exit(1)
         # randomly choose an action that maximizes the size of the piece placed
         piece_sizes = [self.game.piece_sizes[a[1]] for a in valid_moves]
         max_pieces = [1 if a == max(piece_sizes) else 0 for a in piece_sizes]
@@ -96,7 +92,7 @@ class MCTS():
             v: the negative of the value of the current canonicalBoard
         """
 
-        s = game.get_canonical_board()
+        s = np.array2string(game.get_canonical_board())
 
         # Check if game has ended given this board
         if s not in self.Es:
@@ -107,9 +103,13 @@ class MCTS():
             # terminal node
             return -self.Es[s]
 
-        # leaf node (non-terminal for now)        
+        # leaf node (non-terminal for now) (EXPAND)       
         if s not in self.Ps:
-            valids = game.get_valid_moves(1)
+            valids = game.get_valid_moves()
+            if len(valids) == 0:
+                self.Vs[s] = []
+                self.Ns[s] = 0
+                return 0
             self.Ps[s], v = self.heuristic(valids) # self.nnet.predict(canonicalBoard)
             
             # eventually this will pass all the board states after the valid moves 
@@ -138,6 +138,8 @@ class MCTS():
             return -v
 
         valids = self.Vs[s]
+        if len(valids) == 0:
+            return 0
         cur_best = -float('inf')
         best_act = -1
 
