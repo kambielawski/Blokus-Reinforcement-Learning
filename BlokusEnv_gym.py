@@ -1,5 +1,4 @@
 import gym
-import pygame
 import numpy as np
 from gym import spaces
 
@@ -27,7 +26,7 @@ class BlokusEnv(gym.Env):
         # initialize new game
         self.game = Blokus(5,4,20)
 
-    def step(self, action):
+    def step(self, action=None):
         observation = 0
         reward = 0
         info = 0
@@ -42,7 +41,15 @@ class BlokusEnv(gym.Env):
 
     def render(self):
         self.display.update(self.game.game_board)
-        # self.game.game_board.display_pygame()
+
+    def display_score(self):
+        scores = self.game.score()
+        bgscore = scores[1] + scores[3]
+        ryscore = scores[0] + scores[2]
+        bgleft = 178-bgscore
+        ryleft = 178-ryscore
+        print('Blue & Green: {bg} ({bgleft} left)\nRed & Yellow: {ry} ({ryleft} left)\n'
+                .format(bg=bgscore, ry=ryscore, bgleft=bgleft, ryleft=ryleft))
 
     def close(self):
         self.display.end()
