@@ -52,31 +52,20 @@ class Blokus():
             self.make_move(action)
         else: 
             # ask player to make move (this function updates player and self.board)
-            if self.turn == 1:
-                move = current_player.make_move(self.game_board,self.pieces, 'random')
-            elif self.turn == 2:
-                move = current_player.make_move(self.game_board,self.pieces, 'random')
-            else:
-                move = current_player.make_move(self.game_board,self.pieces, 'random')
-            
-            # if no move could be made, increment counter by 1
-            # else reset counter to 0
-            if  move == False: #no move available
-                self.turns_since_last_move = self.turns_since_last_move + 1
-            else:
-                self.turns_since_last_move = 0
+            current_player.make_move(self.game_board,self.pieces, 'random')
             
             # eventually, log each move
             
             # end game if a player has played all pieces
             for player in self.player_list:
                 if np.prod(player.played) == 1:
-                    self.turns_since_last_move = self.n_players
+                    done = True
+                    return done
         
             # change to next player
             self.turn = self.turn % len(self.player_list) + 1
 
-        done = self.turns_since_last_move == self.n_players
+        done = all([len(player.valid_moves) == 0 for player in self.player_list])
 
         return done
 
