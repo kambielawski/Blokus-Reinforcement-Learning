@@ -96,7 +96,7 @@ class MCTS():
             v: the negative of the value of the current canonicalBoard
         """
 
-        s = game.get_string_representation()
+        s = game.get_canonical_board()
 
         # Check if game has ended given this board
         if s not in self.Es:
