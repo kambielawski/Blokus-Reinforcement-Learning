@@ -1,5 +1,5 @@
 import numpy as np
-from Board import Board
+from blokus.engine.board import Board
 import time
 
 # space_heuristic() - returns the decimal ratio of space "controlled" by 

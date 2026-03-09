@@ -1,14 +1,9 @@
 """Comprehensive tests for the Blokus game engine (game_state.py)."""
 
-import sys
-import os
 import numpy as np
 import pytest
 
-# Ensure repo root is on path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
-from game_state import (
+from blokus.engine.game_state import (
     GameState, load_pieces, clear_piece_cache,
     encode_action, decode_action,
     BOARD_SIZE, NUM_PIECES, MAX_ORIENTATIONS, NUM_COLORS,
@@ -396,7 +391,7 @@ class TestTerminal:
 
     def test_full_game_terminates(self):
         """A random game should always terminate."""
-        from game_state import play_random_game
+        from blokus.engine.game_state import play_random_game
         final, history = play_random_game('standard', seed=42)
         assert final.is_terminal()
         assert len(history) > 10
@@ -429,12 +424,12 @@ class TestGameModes:
             state = state.pass_turn()
 
     def test_dual_game_completes(self):
-        from game_state import play_random_game
+        from blokus.engine.game_state import play_random_game
         final, history = play_random_game('dual', seed=99)
         assert final.is_terminal()
 
     def test_dual_rewards_are_two_agents(self):
-        from game_state import play_random_game
+        from blokus.engine.game_state import play_random_game
         final, _ = play_random_game('dual', seed=99)
         rewards = final.get_rewards()
         assert set(rewards.keys()) == {0, 1}
@@ -442,7 +437,7 @@ class TestGameModes:
         assert abs(rewards[0] + rewards[1]) < 1e-6
 
     def test_standard_rewards_are_four_agents(self):
-        from game_state import play_random_game
+        from blokus.engine.game_state import play_random_game
         final, _ = play_random_game('standard', seed=42)
         rewards = final.get_rewards()
         assert set(rewards.keys()) == {0, 1, 2, 3}
@@ -551,7 +546,7 @@ class TestEdgeCases:
 
     def test_game_ends_no_crash(self):
         """Full game runs without errors."""
-        from game_state import play_random_game
+        from blokus.engine.game_state import play_random_game
         for seed in [1, 42, 100, 999]:
             final, hist = play_random_game('standard', seed=seed)
             assert final.is_terminal()
@@ -559,7 +554,7 @@ class TestEdgeCases:
             assert all(s >= 0 for s in scores.values())
 
     def test_dual_game_ends_no_crash(self):
-        from game_state import play_random_game
+        from blokus.engine.game_state import play_random_game
         for seed in [1, 42, 100, 999]:
             final, hist = play_random_game('dual', seed=seed)
             assert final.is_terminal()

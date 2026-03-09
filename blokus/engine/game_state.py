@@ -15,8 +15,20 @@ import os
 import random as _random
 from typing import List, Tuple, Dict, Optional, Set
 
-# Import existing Piece class for loading pickle data
-from Piece import Piece
+# Import Piece class (used for loading/unpickling piece definitions)
+from blokus.engine.piece import Piece
+
+# Repo root for resolving data paths
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+class _PieceUnpickler(pickle.Unpickler):
+    """Custom unpickler that redirects old 'Piece.Piece' references
+    to the new package location 'blokus.engine.piece.Piece'."""
+    def find_class(self, module: str, name: str):
+        if module == 'Piece' and name == 'Piece':
+            return Piece
+        return super().find_class(module, name)
 
 # =============================================================================
 # Constants
@@ -93,11 +105,10 @@ def load_pieces(pickle_path: Optional[str] = None) -> List[PieceInfo]:
         return _PIECES_CACHE
 
     if pickle_path is None:
-        pickle_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   'blokus_pieces_lim_5.pkl')
+        pickle_path = os.path.join(_REPO_ROOT, 'data', 'blokus_pieces.pkl')
 
     with open(pickle_path, 'rb') as f:
-        all_pieces = pickle.load(f)
+        all_pieces = _PieceUnpickler(f).load()
 
     pieces: List[PieceInfo] = []
     for piece in all_pieces:

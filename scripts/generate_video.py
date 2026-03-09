@@ -8,10 +8,10 @@ import sys
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-# Add repo root to path so we can import game_state
+# Add repo root to path so blokus package is importable when running as a script
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
-from game_state import (
+from blokus.engine.game_state import (
     GameState, play_random_game, decode_action,
     BOARD_SIZE, NUM_COLORS, COLOR_NAMES, COLOR_RGB,
 )

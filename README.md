@@ -9,44 +9,37 @@ Forked from [DerekGloudemans/Blokus-Reinforcement-Learning](https://github.com/D
 ## Current State
 
 ### Working
-- **New game engine** (`game_state.py`): Clean, immutable `GameState` class for RL
+- **Game engine** (`blokus.engine`): Clean, immutable `GameState` class for RL
   - Supports two game modes: **standard 4-player** and **1v1 dual-color**
   - Canonical action encoding (67,200 action space)
   - Neural network state representation (5×20×20 float tensor)
   - Fast legal move generation via numpy masks
   - Full test suite (61 tests)
-- **Legacy game engine**: Full Blokus rules implementation (2 or 4 players, configurable board size)
 - **Piece system**: All 21 standard pieces with rotation/flip/translation transforms
-- **Heuristic agents**: Space-filling heuristic (flood-fill territory estimation) and random play
-- **Visualization**: Animated GIF generation, pygame board rendering, seaborn heatmaps
+- **Heuristic agents**: Space-filling heuristic (flood-fill territory estimation)
+- **Visualization**: Animated GIF generation, board rendering
 
 ### In Progress
 - AlphaZero self-play training pipeline (MCTS + neural network policy/value head)
 
 ### Not Yet Implemented
-- Interactive human play mode
 - MCTS (Monte Carlo Tree Search)
 - Neural network for joint policy + value estimation
 - Self-play data generation pipeline
 - Training loop with experience replay
+- Interactive human play mode
 
 ## Quick Start
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Play a random game using the new engine
-python game_state.py
+# Install the package (editable mode with all deps)
+pip install -e ".[all]"
 
 # Run the test suite
 python -m pytest tests/ -v
 
 # Generate visualization GIFs (saved to output/)
 python scripts/generate_video.py
-
-# Play a random game using the legacy engine (opens pygame window)
-python Game.py
 ```
 
 ## Game Modes
@@ -58,7 +51,7 @@ python Game.py
 2 agents, each controlling two colors. Turn order cycles through all 4 colors (0→1→2→3). Agent 0 plays colors 0 and 2; Agent 1 plays colors 1 and 3. Rewards are combined per-agent.
 
 ```python
-from game_state import GameState, play_random_game
+from blokus.engine import GameState, play_random_game
 
 # Standard game
 state = GameState.new_game('standard')
@@ -89,17 +82,17 @@ print(state.get_rewards())
 
 ## Architecture
 
-### New Engine (`game_state.py`)
-- `GameState` — immutable game state with `apply_action()` / `pass_turn()` / `get_legal_actions()`
-- `encode_action()` / `decode_action()` — flat integer action encoding
-- `load_pieces()` — pre-computes piece orientations from pickle
-- `play_random_game()` — utility to run a full random game
-
-### Legacy Engine
-- `Piece.py` — piece representation and geometric transforms
-- `Board.py` — board state and move validation
-- `Player.py` — player state, valid move tracking, and move selection
-- `Game.py` — game orchestration (turns, scoring, piece loading)
-- `heuristics.py` — hand-crafted evaluation functions
+```
+blokus/
+  engine/          # Game engine (GameState, pieces, board, heuristics)
+  agents/          # RL agents (future)
+  mcts/            # Monte Carlo Tree Search (future)
+  nn/              # Neural network models (future)
+scripts/           # CLI utilities (visualization, etc.)
+tests/             # pytest suite
+data/              # Piece definitions, trained models
+legacy/            # Original code preserved for reference
+configs/           # Training configs (future)
+```
 
 See [CLAUDE.md](CLAUDE.md) for detailed architectural notes and development conventions.

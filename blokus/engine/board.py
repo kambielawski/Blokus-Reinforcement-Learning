@@ -1,4 +1,4 @@
-from Piece import Piece
+from blokus.engine.piece import Piece
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
