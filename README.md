@@ -42,8 +42,8 @@ python game_state.py
 # Run the test suite
 python -m pytest tests/ -v
 
-# Generate visualization GIFs
-python generate_video.py
+# Generate visualization GIFs (saved to output/)
+python scripts/generate_video.py
 
 # Play a random game using the legacy engine (opens pygame window)
 python Game.py

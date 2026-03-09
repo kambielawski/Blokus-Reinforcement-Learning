@@ -5,13 +5,7 @@ Building an AlphaZero-inspired self-play reinforcement learning agent for the bo
 
 ## Repo Structure
 ```
-├── game_state.py             # [NEW] Clean immutable GameState for RL (supports standard + dual mode)
-├── generate_video.py         # [NEW] Generates animated GIF visualizations of random games
-├── tests/
-│   └── test_game_state.py    # [NEW] Comprehensive pytest suite (61 tests)
-├── requirements.txt          # [NEW] Python dependencies
-├── game_standard.gif         # [NEW] Visualization of a standard 4-player game
-├── game_dual.gif             # [NEW] Visualization of a 1v1 dual-color game
+├── game_state.py             # Clean immutable GameState for RL (supports standard + dual mode)
 ├── Piece.py                  # Piece representation (occupied squares, corners, adjacents, transforms)
 ├── Board.py                  # Board state, move validation, rendering (numpy/seaborn/pygame)
 ├── Player.py                 # Player logic: valid move generation, move selection (random/heuristic/manual)
@@ -21,9 +15,15 @@ Building an AlphaZero-inspired self-play reinforcement learning agent for the bo
 ├── BlokusEnv_gym.py          # [Stub] OpenAI Gym environment skeleton — not implemented
 ├── Blokus_RL_gym.py          # [Stub] Gym test script
 ├── blokus_pieces_lim_5.pkl   # Pickled piece definitions (21 standard Blokus pieces)
+├── requirements.txt          # Python dependencies
+├── scripts/
+│   └── generate_video.py     # Generates animated GIF visualizations of random games
+├── tests/
+│   └── test_game_state.py    # Comprehensive pytest suite (61 tests)
+├── output/                   # Generated artifacts (gitignored) — GIFs, videos, etc.
+├── readme_ims/               # Images for README
 ├── heuristic_buffer.cpkl     # Saved replay buffer from heuristic training
 ├── current_buffer.cpkl       # Saved replay buffer snapshot
-├── readme_ims/               # Images for README
 └── Piece Images.JPG          # Reference image of all Blokus pieces
 ```
 
@@ -52,7 +52,7 @@ python -m pytest tests/ -v    # 61 tests covering pieces, moves, state transitio
 
 ### Generating visualizations
 ```bash
-python generate_video.py      # Generates game_standard.gif and game_dual.gif
+python scripts/generate_video.py   # Generates output/game_standard.gif and output/game_dual.gif
 ```
 
 ### Visualization options

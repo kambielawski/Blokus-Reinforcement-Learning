@@ -8,6 +8,9 @@ import sys
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+# Add repo root to path so we can import game_state
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+
 from game_state import (
     GameState, play_random_game, decode_action,
     BOARD_SIZE, NUM_COLORS, COLOR_NAMES, COLOR_RGB,
@@ -116,7 +119,9 @@ def generate_game_gif(game_mode: str, seed: int, output_path: str,
 
 
 if __name__ == '__main__':
-    out_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
+    out_dir = os.path.join(repo_root, 'output')
+    os.makedirs(out_dir, exist_ok=True)
 
     generate_game_gif(
         'standard', seed=42,

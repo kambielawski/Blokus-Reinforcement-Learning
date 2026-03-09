@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 .DS_Store
+.pytest_cache/
+
+# Generated output (GIFs, videos, etc.) — regenerate with: python scripts/generate_video.py
+output/
