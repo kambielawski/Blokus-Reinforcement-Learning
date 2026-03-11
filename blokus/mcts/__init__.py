@@ -1,1 +1,5 @@
-"""Monte Carlo Tree Search for Blokus (future Phase 3)."""
+"""Monte Carlo Tree Search for Blokus AlphaZero."""
+
+from blokus.mcts.mcts import MCTS, MCTSNode
+
+__all__ = ['MCTS', 'MCTSNode']

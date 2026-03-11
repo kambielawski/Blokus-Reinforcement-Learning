@@ -8,3 +8,6 @@ build/
 
 # Generated output (GIFs, videos, etc.) — regenerate with: python scripts/generate_video.py
 output/
+
+# Training checkpoints and model weights
+data/checkpoints/

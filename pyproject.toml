@@ -13,6 +13,7 @@ license = {text = "MIT"}
 dependencies = [
     "numpy>=1.21.0",
     "Pillow>=9.0.0",
+    "torch>=2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +27,9 @@ dev = [
 ]
 all = [
     "blokus-alphazero[viz,dev]",
+]
+rl = [
+    "torch>=2.0.0",
 ]
 
 [tool.setuptools.packages.find]

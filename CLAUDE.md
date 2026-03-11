@@ -249,12 +249,63 @@ The representation is always from the perspective of the player to move. This me
 - `pass_turn()` does NOT copy the board (just wraps same array in new GameState) — safe because the board is unchanged.
 - Piece data is loaded once and cached globally. Call `clear_piece_cache()` to force reload (useful in tests).
 
+## Neural Network Architecture
+
+`blokus/nn/network.py` — AlphaZero-style dual-headed ResNet.
+
+**Input:** `(batch, 5, 20, 20)` from `get_nn_state()` + `(batch, 84)` piece-remaining vector + `(batch, 67200)` legal actions mask.
+
+**Architecture:**
+- Initial conv: 5 → 128 filters (3×3), batch norm, ReLU
+- 5 residual blocks (configurable): each = two 3×3 convs with batch norm + skip connection
+- **Policy head (convolutional):** 128 → 168 (1×1) conv + batch norm + piece-remaining bias (84 → 168 FC, broadcast over spatial dims) + ReLU → flatten to 67,200 logits → masked log-softmax
+- **Value head:** 128 → 1 (1×1) conv + batch norm + ReLU → flatten + concat piece-remaining → FC(484, 256) → ReLU → FC(256, 1) → tanh
+
+**Key function:** `make_pieces_remaining_vector(state)` builds the 84-dim binary vector (21 pieces × 4 colors in turn order).
+
+**Parameter count:** ~1.6M (5 blocks, 128 channels).
+
+### Importing
+
+```python
+from blokus.nn import BlokusNetwork, make_pieces_remaining_vector
+from blokus.mcts import MCTS
+from blokus.agents import AlphaZeroAgent, self_play_game
+```
+
+## MCTS
+
+`blokus/mcts/mcts.py` — PUCT-based Monte Carlo Tree Search (AlphaZero-style).
+
+- Selection: PUCT formula `a = argmax(Q + c_puct * P * sqrt(N_parent) / (1 + N))`
+- Expansion: NN evaluation for (policy, value) at leaf nodes
+- Backup: propagate value up tree, negated for opponents
+- Root noise: Dirichlet noise for exploration
+- Temperature-based action selection from visit counts
+
+## Self-Play & Training
+
+- `blokus/agents/alpha_zero.py` — `AlphaZeroAgent` (NN + MCTS) and `self_play_game()` function
+- `scripts/train.py` — Full training loop: self-play → collect examples → train network → iterate
+
+### Running training
+
+```bash
+# Quick test run (small network, few games)
+python scripts/train.py --iterations 5 --games-per-iter 2 --sims 25 --num-blocks 2 --channels 32
+
+# Full training
+python scripts/train.py --iterations 100 --games-per-iter 10 --sims 100
+```
+
+Checkpoints saved to `data/checkpoints/` (gitignored).
+
 ## Development Roadmap
 
 | Phase | Description | Status |
 |---|---|---|
 | **1. Engine** | GameState, two game modes, tests, visualization | **Done** |
-| **2. Neural Network** | ResNet or similar for joint policy/value heads | Planned |
-| **3. MCTS** | Monte Carlo Tree Search with NN-guided rollouts | Planned |
-| **4. Self-Play** | Data generation loop + training pipeline | Planned |
+| **2. Neural Network** | ResNet with convolutional policy + value heads | **Done** |
+| **3. MCTS** | PUCT-based tree search with NN-guided evaluation | **Done** |
+| **4. Self-Play** | Data generation loop + training pipeline | **Done** |
 | **5. Interactive** | Human vs agent play mode | Planned |
