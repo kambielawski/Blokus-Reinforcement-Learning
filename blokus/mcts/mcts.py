@@ -2,6 +2,12 @@
 
 PUCT-based MCTS that uses a neural network for leaf evaluation and
 prior probability estimation. Follows the AlphaZero paper (Silver et al. 2018).
+
+Optimizations:
+- Lazy child creation: child GameStates are only created when visited
+- Single legal-move computation: legal actions and mask share one call
+- Batched NN inference: multiple leaves evaluated in one forward pass
+  using virtual losses to encourage exploration diversity
 """
 
 import math
@@ -9,29 +15,53 @@ import numpy as np
 import torch
 from typing import Optional, Dict, List, Tuple
 
-from blokus.engine.game_state import GameState, ACTION_SPACE_SIZE, NUM_COLORS, NUM_PIECES
+from blokus.engine.game_state import (
+    GameState, ACTION_SPACE_SIZE, NUM_COLORS, NUM_PIECES,
+)
 
 
 class MCTSNode:
     """A node in the MCTS search tree.
 
-    Each node corresponds to a game state. Edges to children represent actions.
+    Children use lazy state creation: the GameState for a child is only
+    computed (via apply_action) when that child is first selected.
     """
-    __slots__ = ['state', 'parent', 'action', 'children',
-                 'visit_count', 'total_value', 'prior',
-                 'is_expanded', 'is_terminal']
+    __slots__ = [
+        'state', 'parent', 'action', 'children',
+        'visit_count', 'total_value', 'prior',
+        'is_expanded', 'is_terminal',
+        '_parent_state',  # parent's GameState, for lazy child creation
+    ]
 
-    def __init__(self, state: GameState, parent: Optional['MCTSNode'] = None,
-                 action: int = -1, prior: float = 0.0):
-        self.state = state
+    def __init__(self, state: Optional[GameState],
+                 parent: Optional['MCTSNode'] = None,
+                 action: int = -1, prior: float = 0.0,
+                 parent_state: Optional[GameState] = None):
+        self.state = state  # None until lazily created for non-root nodes
         self.parent = parent
-        self.action = action  # action that led to this node from parent
-        self.prior = prior    # P(s, a) from the neural network
+        self.action = action
+        self.prior = prior
         self.children: Dict[int, 'MCTSNode'] = {}
         self.visit_count = 0
         self.total_value = 0.0
         self.is_expanded = False
-        self.is_terminal = state.is_terminal()
+        self.is_terminal = False
+        self._parent_state = parent_state
+
+        if state is not None:
+            self.is_terminal = state.is_terminal()
+
+    def ensure_state(self) -> GameState:
+        """Lazily create the GameState if not yet materialized."""
+        if self.state is None:
+            if self.action == -1:
+                # Pass action
+                self.state = self._parent_state.pass_turn()
+            else:
+                self.state = self._parent_state.apply_action(self.action)
+            self.is_terminal = self.state.is_terminal()
+            self._parent_state = None  # release reference
+        return self.state
 
     @property
     def mean_value(self) -> float:
@@ -52,6 +82,7 @@ class MCTS:
         dirichlet_epsilon: Weight of Dirichlet noise vs. network prior.
         temperature: Temperature for action selection from visit counts.
         device: PyTorch device for network inference.
+        batch_size: Number of leaves to batch for NN inference (0 = no batching).
     """
 
     def __init__(self, network, c_puct: float = 1.5,
@@ -59,7 +90,8 @@ class MCTS:
                  dirichlet_alpha: float = 0.3,
                  dirichlet_epsilon: float = 0.25,
                  temperature: float = 1.0,
-                 device: Optional[torch.device] = None):
+                 device: Optional[torch.device] = None,
+                 batch_size: int = 8):
         self.network = network
         self.c_puct = c_puct
         self.num_simulations = num_simulations
@@ -67,6 +99,9 @@ class MCTS:
         self.dirichlet_epsilon = dirichlet_epsilon
         self.temperature = temperature
         self.device = device or torch.device('cpu')
+        self.batch_size = batch_size
+        # Virtual loss magnitude — discourages re-selecting the same leaf
+        self._virtual_loss = 3.0
 
     def search(self, state: GameState) -> Tuple[np.ndarray, float]:
         """Run MCTS from the given state.
@@ -76,28 +111,16 @@ class MCTS:
             value: Root value estimate.
         """
         root = MCTSNode(state)
-        self._expand(root, add_noise=True)
+        # Expand root synchronously (need priors before batched search)
+        self._expand_single(root, add_noise=True)
 
-        for _ in range(self.num_simulations):
-            node = root
-            # Selection: traverse tree using PUCT
-            while node.is_expanded and not node.is_terminal:
-                node = self._select_child(node)
-            # Expansion and evaluation
-            if not node.is_terminal:
-                value = self._expand(node)
+        sims_done = 0
+        while sims_done < self.num_simulations:
+            if self.batch_size > 1:
+                sims_done += self._run_batched_sims(root, sims_done)
             else:
-                # Terminal node: use actual game reward
-                rewards = node.state.get_rewards()
-                # Value from perspective of the player who moved TO this state
-                # (i.e., the parent's current agent)
-                if node.parent is not None:
-                    agent = node.parent.state.get_current_agent()
-                else:
-                    agent = node.state.get_current_agent()
-                value = rewards.get(agent, 0.0)
-            # Backup
-            self._backup(node, value)
+                self._run_single_sim(root)
+                sims_done += 1
 
         return self._get_policy(root), root.mean_value
 
@@ -113,7 +136,7 @@ class MCTS:
 
         legal = state.get_legal_actions()
         if not legal:
-            return -1, policy, value  # must pass
+            return -1, policy, value
 
         if self.temperature < 0.01:
             # Greedy: pick highest visit count
@@ -128,7 +151,6 @@ class MCTS:
             probs = np.zeros(len(legal), dtype=np.float64)
             for i, a in enumerate(legal):
                 probs[i] = policy[a]
-            # Apply temperature
             if self.temperature != 1.0:
                 probs = np.power(probs + 1e-10, 1.0 / self.temperature)
             probs /= probs.sum()
@@ -137,6 +159,101 @@ class MCTS:
 
         return action, policy, value
 
+    # ------------------------------------------------------------------
+    # Single-sim path (batch_size <= 1)
+    # ------------------------------------------------------------------
+
+    def _run_single_sim(self, root: MCTSNode) -> None:
+        """Run one MCTS simulation: select → expand → backup."""
+        node = root
+        while node.is_expanded and not node.is_terminal:
+            node = self._select_child(node)
+
+        if not node.is_terminal:
+            node.ensure_state()
+            value = self._expand_single(node)
+        else:
+            value = self._terminal_value(node)
+
+        self._backup(node, value)
+
+    # ------------------------------------------------------------------
+    # Batched-sim path (batch_size > 1)
+    # ------------------------------------------------------------------
+
+    def _run_batched_sims(self, root: MCTSNode, sims_done: int) -> int:
+        """Run a batch of MCTS simulations with virtual losses.
+
+        Selects up to batch_size leaves, applies virtual losses during
+        selection to encourage diversity, evaluates them in one NN call,
+        then backs up real values and removes virtual losses.
+
+        Returns the number of simulations completed.
+        """
+        remaining = self.num_simulations - sims_done
+        batch_target = min(self.batch_size, remaining)
+
+        leaves: List[MCTSNode] = []
+        terminal_leaves: List[Tuple[MCTSNode, float]] = []
+
+        for _ in range(batch_target):
+            node = root
+            # Selection with virtual loss applied to previously selected paths
+            while node.is_expanded and not node.is_terminal:
+                node = self._select_child(node)
+
+            if node.is_terminal:
+                value = self._terminal_value(node)
+                terminal_leaves.append((node, value))
+                # Apply virtual loss so we don't keep selecting this terminal
+                node.visit_count += 1
+                node.total_value -= self._virtual_loss
+            else:
+                node.ensure_state()
+                leaves.append(node)
+                # Apply virtual loss to discourage re-selecting this path
+                self._apply_virtual_loss(node)
+
+        # Backup terminal nodes immediately
+        for node, value in terminal_leaves:
+            # Remove the temporary visit/loss we added
+            node.visit_count -= 1
+            node.total_value += self._virtual_loss
+            self._backup(node, value)
+
+        if not leaves:
+            return len(terminal_leaves)
+
+        # Batched NN evaluation
+        values = self._expand_batch(leaves)
+
+        # Remove virtual losses and backup real values
+        for node, value in zip(leaves, values):
+            self._remove_virtual_loss(node)
+            self._backup(node, value)
+
+        return len(leaves) + len(terminal_leaves)
+
+    def _apply_virtual_loss(self, node: MCTSNode) -> None:
+        """Apply virtual loss along path from node to root."""
+        current = node
+        while current is not None:
+            current.visit_count += 1
+            current.total_value -= self._virtual_loss
+            current = current.parent
+
+    def _remove_virtual_loss(self, node: MCTSNode) -> None:
+        """Remove virtual loss along path from node to root."""
+        current = node
+        while current is not None:
+            current.visit_count -= 1
+            current.total_value += self._virtual_loss
+            current = current.parent
+
+    # ------------------------------------------------------------------
+    # Tree operations
+    # ------------------------------------------------------------------
+
     def _select_child(self, node: MCTSNode) -> MCTSNode:
         """Select child with highest PUCT score."""
         best_score = -float('inf')
@@ -144,7 +261,6 @@ class MCTS:
         sqrt_parent = math.sqrt(node.visit_count)
 
         for child in node.children.values():
-            # PUCT formula
             q = child.mean_value
             u = self.c_puct * child.prior * sqrt_parent / (1 + child.visit_count)
             score = q + u
@@ -154,43 +270,89 @@ class MCTS:
 
         return best_child
 
-    def _expand(self, node: MCTSNode, add_noise: bool = False) -> float:
-        """Expand a leaf node using the neural network.
+    def _expand_single(self, node: MCTSNode, add_noise: bool = False) -> float:
+        """Expand a leaf node using a single NN evaluation.
 
-        Returns the value estimate from the network.
+        Returns the value estimate.
         """
-        state = node.state
+        state = node.ensure_state()
 
-        # Handle pass (no legal moves)
         legal = state.get_legal_actions()
         if not legal:
-            # If a color must pass, the node has one child: the pass state
             pass_state = state.pass_turn()
             child = MCTSNode(pass_state, parent=node, action=-1, prior=1.0)
             node.children[-1] = child
             node.is_expanded = True
-            # Evaluate via network anyway for value
-            return self._evaluate(state)
+            return self._evaluate_single(state, legal)
 
-        # Get network predictions
-        policy_probs, value = self._evaluate_with_policy(state)
-
-        # Extract priors for legal actions only
-        legal_priors = {}
-        total = 0.0
+        # Build legal actions mask from the known legal list (avoid recomputation)
+        legal_mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
         for a in legal:
-            legal_priors[a] = policy_probs[a]
-            total += policy_probs[a]
+            legal_mask[a] = 1.0
 
-        # Renormalize
+        policy_probs, value = self._evaluate_single(state, legal, legal_mask)
+
+        self._create_children(node, state, legal, policy_probs, add_noise)
+        node.is_expanded = True
+        return value
+
+    def _expand_batch(self, leaves: List[MCTSNode]) -> List[float]:
+        """Expand multiple leaf nodes with one batched NN evaluation.
+
+        Returns list of value estimates, one per leaf.
+        """
+        from blokus.nn.network import make_pieces_remaining_vector
+
+        n = len(leaves)
+        # Pre-allocate numpy arrays for the batch
+        board_states = np.empty((n, 5, 20, 20), dtype=np.float32)
+        pieces_vecs = np.empty((n, NUM_PIECES * NUM_COLORS), dtype=np.float32)
+        legal_masks = np.zeros((n, ACTION_SPACE_SIZE), dtype=np.float32)
+
+        legal_actions_list: List[List[int]] = []
+
+        for i, node in enumerate(leaves):
+            state = node.state  # already ensured
+            legal = state.get_legal_actions()
+            legal_actions_list.append(legal)
+
+            board_states[i] = state.get_nn_state()
+            pieces_vecs[i] = make_pieces_remaining_vector(state)
+            for a in legal:
+                legal_masks[i, a] = 1.0
+
+        # Single batched NN forward pass
+        policies, values = self._nn_forward_batch(board_states, pieces_vecs, legal_masks)
+
+        # Create children for each leaf
+        for i, node in enumerate(leaves):
+            state = node.state
+            legal = legal_actions_list[i]
+
+            if not legal:
+                pass_state = state.pass_turn()
+                child = MCTSNode(pass_state, parent=node, action=-1, prior=1.0)
+                node.children[-1] = child
+            else:
+                self._create_children(
+                    node, state, legal, policies[i],
+                    add_noise=False,
+                )
+            node.is_expanded = True
+
+        return values
+
+    def _create_children(self, node: MCTSNode, state: GameState,
+                         legal: List[int], policy_probs: np.ndarray,
+                         add_noise: bool) -> None:
+        """Create lazy child nodes with priors from the policy."""
+        # Extract and renormalize priors for legal actions
+        priors = np.array([policy_probs[a] for a in legal], dtype=np.float64)
+        total = priors.sum()
         if total > 0:
-            for a in legal_priors:
-                legal_priors[a] /= total
+            priors /= total
         else:
-            # Uniform if network gives zero everywhere
-            uniform = 1.0 / len(legal)
-            for a in legal_priors:
-                legal_priors[a] = uniform
+            priors[:] = 1.0 / len(legal)
 
         # Add Dirichlet noise at root
         if add_noise and len(legal) > 0:
@@ -198,74 +360,95 @@ class MCTS:
                 [self.dirichlet_alpha] * len(legal)
             )
             eps = self.dirichlet_epsilon
-            for i, a in enumerate(legal):
-                legal_priors[a] = (1 - eps) * legal_priors[a] + eps * noise[i]
+            priors = (1 - eps) * priors + eps * noise
 
-        # Create children
-        for a in legal:
-            child_state = state.apply_action(a)
-            child = MCTSNode(child_state, parent=node, action=a,
-                             prior=legal_priors[a])
+        # Create children lazily (no apply_action yet)
+        for i, a in enumerate(legal):
+            child = MCTSNode(
+                state=None,  # lazy — created on first visit
+                parent=node,
+                action=a,
+                prior=float(priors[i]),
+                parent_state=state,
+            )
             node.children[a] = child
 
-        node.is_expanded = True
-        return value
+    # ------------------------------------------------------------------
+    # NN inference
+    # ------------------------------------------------------------------
 
-    def _evaluate(self, state: GameState) -> float:
-        """Get value estimate from network for a state."""
-        _, value = self._evaluate_with_policy(state)
-        return value
+    def _evaluate_single(self, state: GameState,
+                         legal: List[int],
+                         legal_mask: Optional[np.ndarray] = None
+                         ) -> Tuple[np.ndarray, float]:
+        """Evaluate a single state with the NN.
 
-    @torch.no_grad()
-    def _evaluate_with_policy(self, state: GameState) -> Tuple[np.ndarray, float]:
-        """Get policy and value from the neural network.
-
-        Returns:
-            policy: (ACTION_SPACE_SIZE,) probability distribution.
-            value: scalar in [-1, 1].
+        Accepts pre-computed legal actions list and optional mask to
+        avoid redundant get_legal_actions() calls.
         """
         from blokus.nn.network import make_pieces_remaining_vector
 
-        board_state = torch.from_numpy(
-            state.get_nn_state()
-        ).unsqueeze(0).to(self.device)
+        board_np = state.get_nn_state()
+        pieces_np = make_pieces_remaining_vector(state)
 
-        pieces_vec = torch.from_numpy(
-            make_pieces_remaining_vector(state)
-        ).unsqueeze(0).to(self.device)
+        if legal_mask is None:
+            legal_mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
+            for a in legal:
+                legal_mask[a] = 1.0
 
-        legal_mask = torch.from_numpy(
-            state.get_legal_actions_mask()
-        ).unsqueeze(0).to(self.device)
+        policies, values = self._nn_forward_batch(
+            board_np[np.newaxis],
+            pieces_np[np.newaxis],
+            legal_mask[np.newaxis],
+        )
+        return policies[0], values[0]
+
+    @torch.no_grad()
+    def _nn_forward_batch(self, board_states: np.ndarray,
+                          pieces_vecs: np.ndarray,
+                          legal_masks: np.ndarray
+                          ) -> Tuple[np.ndarray, List[float]]:
+        """Run batched NN forward pass.
+
+        Args:
+            board_states: (N, 5, 20, 20) float32
+            pieces_vecs: (N, 84) float32
+            legal_masks: (N, 67200) float32
+
+        Returns:
+            policies: (N, 67200) probability arrays
+            values: list of N floats
+        """
+        board_t = torch.from_numpy(board_states).to(self.device)
+        pieces_t = torch.from_numpy(pieces_vecs).to(self.device)
+        mask_t = torch.from_numpy(legal_masks).to(self.device)
 
         self.network.eval()
-        log_policy, value = self.network(board_state, pieces_vec, legal_mask)
+        log_policy, value = self.network(board_t, pieces_t, mask_t)
 
-        # Convert log-probs to probs
-        policy = torch.exp(log_policy).squeeze(0).cpu().numpy()
-        value = value.item()
+        policies = torch.exp(log_policy).cpu().numpy()
+        values = value.cpu().tolist()
 
-        return policy, value
+        return policies, values
+
+    def _terminal_value(self, node: MCTSNode) -> float:
+        """Get value for a terminal node from actual game rewards."""
+        state = node.ensure_state()
+        rewards = state.get_rewards()
+        if node.parent is not None:
+            agent = node.parent.ensure_state().get_current_agent()
+        else:
+            agent = state.get_current_agent()
+        return rewards.get(agent, 0.0)
 
     def _backup(self, node: MCTSNode, value: float) -> None:
-        """Propagate value back up the tree.
-
-        Value is negated at each level because players alternate
-        (what's good for one player is bad for the opponent).
-        In 4-player Blokus, we track value from the perspective of the
-        agent at the root.
-        """
-        # For multi-player, we need to track whose perspective the value is from.
-        # The value from _expand is from the current agent's perspective.
-        # We propagate the actual value up, flipping sign based on whether
-        # the node's agent matches the leaf's agent.
-        leaf_agent = node.state.get_current_agent()
+        """Propagate value back up the tree."""
+        leaf_agent = node.ensure_state().get_current_agent()
 
         current = node
         while current is not None:
             current.visit_count += 1
-            # Determine if this node's controlling agent matches the leaf
-            if current.state.get_current_agent() == leaf_agent:
+            if current.ensure_state().get_current_agent() == leaf_agent:
                 current.total_value += value
             else:
                 current.total_value -= value
@@ -276,7 +459,7 @@ class MCTS:
         policy = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
         total = 0
         for action, child in root.children.items():
-            if action >= 0:  # skip pass actions
+            if action >= 0:
                 policy[action] = child.visit_count
                 total += child.visit_count
         if total > 0:
