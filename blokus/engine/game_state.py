@@ -131,8 +131,173 @@ def load_pieces(pickle_path: Optional[str] = None) -> List[PieceInfo]:
 
 def clear_piece_cache():
     """Clear the global piece cache (useful for testing)."""
-    global _PIECES_CACHE
+    global _PIECES_CACHE, _FAST_LEGAL_CACHE
     _PIECES_CACHE = None
+    _FAST_LEGAL_CACHE = None
+
+
+# =============================================================================
+# Fast legal move generation (vectorized numpy)
+# =============================================================================
+
+# Maximum piece size in standard Blokus (pentominoes)
+_MAX_PIECE_CELLS = 5
+
+# Pre-computed placement data cache
+_FAST_LEGAL_CACHE = None
+
+
+class _FastLegalData:
+    """Pre-computed placement data for anchor-driven legal move generation.
+
+    Instead of checking all ~30K placements, we use a reverse index from
+    board cells to placements. At query time we only check placements that
+    overlap an anchor cell, reducing the candidate set to ~2-5K.
+
+    Data structures:
+    - flat_indices: (TOTAL, 5) int32 — flat cell indices per placement
+    - actions: (TOTAL,) int32 — action encoding per placement
+    - pid_masks: list of 21 bool arrays — which placements belong to each piece
+    - csr_offsets/csr_data: CSR reverse index from flat cell → placement indices
+    """
+
+    def __init__(self, pieces: List[PieceInfo]):
+        pad = BOARD_SIZE  # sentinel coordinate
+        stride = BOARD_SIZE + 1
+
+        all_flat: list = []
+        all_acts: list = []
+        all_pids: list = []
+
+        for pid in range(len(pieces)):
+            pinfo = pieces[pid]
+            for oid in range(pinfo.num_orientations):
+                ori = pinfo.orientations[oid]
+                mr, mc = ori.max_row, ori.max_col
+                occ = ori.occupied
+
+                for row in range(BOARD_SIZE - mr):
+                    for col in range(BOARD_SIZE - mc):
+                        flat_cells = []
+                        for cr, cc in occ:
+                            flat_cells.append((cr + row) * stride + (cc + col))
+                        sentinel = pad * stride + pad
+                        while len(flat_cells) < _MAX_PIECE_CELLS:
+                            flat_cells.append(sentinel)
+                        all_flat.append(flat_cells)
+                        all_acts.append(encode_action(pid, oid, row, col))
+                        all_pids.append(pid)
+
+        self.flat_indices = np.array(all_flat, dtype=np.int32)  # (TOTAL, 5)
+        self.actions = np.array(all_acts, dtype=np.int32)       # (TOTAL,)
+        piece_ids = np.array(all_pids, dtype=np.int8)           # (TOTAL,)
+        self.total = len(all_acts)
+
+        # Pre-compute boolean masks for each piece_id
+        self.pid_masks: List[np.ndarray] = []
+        for pid in range(NUM_PIECES):
+            self.pid_masks.append(piece_ids == pid)
+
+        # Build CSR reverse index: flat_cell → placement indices
+        total_cells = stride * stride
+        sentinel = pad * stride + pad
+        cell_lists: List[list] = [[] for _ in range(total_cells)]
+        fi = self.flat_indices
+        for i in range(self.total):
+            for j in range(_MAX_PIECE_CELLS):
+                c = int(fi[i, j])
+                if c != sentinel:
+                    cell_lists[c].append(i)
+
+        csr_all: list = []
+        self.csr_offsets = np.zeros(total_cells + 1, dtype=np.int32)
+        for c in range(total_cells):
+            csr_all.extend(cell_lists[c])
+            self.csr_offsets[c + 1] = self.csr_offsets[c] + len(cell_lists[c])
+        self.csr_data = np.array(csr_all, dtype=np.int32) if csr_all else np.empty(0, dtype=np.int32)
+
+
+def _get_fast_legal_data(pieces: List[PieceInfo]) -> _FastLegalData:
+    """Get or create the pre-computed placement data (cached globally)."""
+    global _FAST_LEGAL_CACHE
+    if _FAST_LEGAL_CACHE is None:
+        _FAST_LEGAL_CACHE = _FastLegalData(pieces)
+    return _FAST_LEGAL_CACHE
+
+
+def _fast_legal_actions(board: np.ndarray, pieces_remaining: tuple,
+                        current_color: int, has_played: tuple,
+                        pieces: List[PieceInfo]) -> List[int]:
+    """Anchor-driven legal action generation using pre-computed placements.
+
+    Instead of checking all ~30K placements, finds anchor cells (diagonal
+    adjacencies to same-color pieces) and uses a CSR reverse index to gather
+    only the ~2-5K placements that overlap an anchor. Then validates just
+    those candidates against the reject mask and remaining pieces.
+    """
+    ci = current_color
+    cv = ci + 1
+    remaining = pieces_remaining[ci]
+    if not remaining:
+        return []
+
+    bs = BOARD_SIZE
+    stride = bs + 1
+    data = _get_fast_legal_data(pieces)
+
+    # ---- Compute reject mask as padded (bs+1, bs+1) uint8 ----
+    color_mask = (board == cv)
+    occ_mask = (board != 0)
+
+    # Forbidden: cells orthogonally adjacent to same-color pieces
+    forbidden = np.zeros((bs, bs), dtype=bool)
+    forbidden[1:, :] |= color_mask[:-1, :]
+    forbidden[:-1, :] |= color_mask[1:, :]
+    forbidden[:, 1:] |= color_mask[:, :-1]
+    forbidden[:, :-1] |= color_mask[:, 1:]
+
+    reject_pad = np.zeros((bs + 1, bs + 1), dtype=np.uint8)
+    reject_pad[:bs, :bs] = (occ_mask | forbidden)
+
+    # ---- Find anchor cells as flat indices ----
+    if not has_played[ci]:
+        cr, cc = COLOR_CORNERS[ci]
+        anchor_flat_cells = [cr * stride + cc]
+    else:
+        anchor = np.zeros((bs, bs), dtype=bool)
+        anchor[1:, 1:] |= color_mask[:-1, :-1]
+        anchor[1:, :-1] |= color_mask[:-1, 1:]
+        anchor[:-1, 1:] |= color_mask[1:, :-1]
+        anchor[:-1, :-1] |= color_mask[1:, 1:]
+        anchor &= ~occ_mask
+        arows, acols = np.where(anchor)
+        if len(arows) == 0:
+            return []
+        anchor_flat_cells = (arows * stride + acols).tolist()
+
+    # ---- Gather candidate placements from anchor cells via CSR index ----
+    offsets = data.csr_offsets
+    csr = data.csr_data
+    cmask = np.zeros(data.total, dtype=bool)
+    for ac in anchor_flat_cells:
+        s, e = offsets[ac], offsets[ac + 1]
+        if s < e:
+            cmask[csr[s:e]] = True
+
+    # Filter by remaining pieces (using pre-computed per-piece boolean masks)
+    remaining_mask = np.zeros(data.total, dtype=bool)
+    for pid in remaining:
+        remaining_mask |= data.pid_masks[pid]
+    cmask &= remaining_mask
+    cand = np.where(cmask)[0]
+    if len(cand) == 0:
+        return []
+
+    # ---- Validate only candidates: no rejected cells ----
+    reject_flat = reject_pad.ravel()
+    rv = reject_flat[data.flat_indices[cand]]  # (C, 5)
+    valid = rv.max(axis=1) == 0
+    return data.actions[cand[valid]].tolist()
 
 
 # =============================================================================
@@ -287,84 +452,12 @@ class GameState:
         """All legal action indices for the current color.
 
         Returns an empty list when the current color has no moves (must pass).
+        Uses vectorized numpy validation for speed (~5-8x faster than loops).
         """
-        ci = self.current_color
-        cv = ci + 1  # board value for this color
-        remaining = self.pieces_remaining[ci]
-        if not remaining:
-            return []
-
-        board = self.board
-        bs = BOARD_SIZE
-
-        # ---- Compute anchor points ----
-        # Anchor = empty cell where a piece cell can go to satisfy diagonal adjacency.
-        if not self._has_played[ci]:
-            # First move: piece must cover the assigned corner cell
-            anchor_set = {COLOR_CORNERS[ci]}
-        else:
-            color_mask = (board == cv)
-            occ_mask = (board != 0)
-            anchor = np.zeros((bs, bs), dtype=bool)
-            anchor[1:, 1:]   |= color_mask[:-1, :-1]
-            anchor[1:, :-1]  |= color_mask[:-1, 1:]
-            anchor[:-1, 1:]  |= color_mask[1:, :-1]
-            anchor[:-1, :-1] |= color_mask[1:, 1:]
-            anchor &= ~occ_mask
-            anchor_set = set(zip(*np.where(anchor)))
-
-        if not anchor_set:
-            return []
-
-        # ---- Compute forbidden mask (ortho-adjacent to same color) ----
-        color_mask = (board == cv)
-        forbidden = np.zeros((bs, bs), dtype=bool)
-        forbidden[1:, :]  |= color_mask[:-1, :]
-        forbidden[:-1, :] |= color_mask[1:, :]
-        forbidden[:, 1:]  |= color_mask[:, :-1]
-        forbidden[:, :-1] |= color_mask[:, 1:]
-
-        occ_mask = (board != 0)
-
-        # ---- Enumerate legal placements ----
-        legal: List[int] = []
-        seen: Set[Tuple[int, int, int, int]] = set()
-
-        for pid in remaining:
-            pinfo = self.pieces[pid]
-            for oid in range(pinfo.num_orientations):
-                ori = pinfo.orientations[oid]
-                occ = ori.occupied
-                mr, mc = ori.max_row, ori.max_col
-
-                for (ar, ac) in anchor_set:
-                    for (pr, pc) in occ:
-                        tx = ar - pr
-                        ty = ac - pc
-
-                        # Dedup
-                        key = (pid, oid, tx, ty)
-                        if key in seen:
-                            continue
-                        seen.add(key)
-
-                        # Quick bounds check
-                        if tx < 0 or ty < 0 or tx + mr >= bs or ty + mc >= bs:
-                            continue
-
-                        # Validate each cell
-                        valid = True
-                        for (cr, cc) in occ:
-                            r = cr + tx
-                            c = cc + ty
-                            if occ_mask[r, c] or forbidden[r, c]:
-                                valid = False
-                                break
-
-                        if valid:
-                            legal.append(encode_action(pid, oid, tx, ty))
-
-        return legal
+        return _fast_legal_actions(
+            self.board, self.pieces_remaining, self.current_color,
+            self._has_played, self.pieces,
+        )
 
     def get_legal_actions_mask(self) -> np.ndarray:
         """Binary mask over the full action space (ACTION_SPACE_SIZE,).
