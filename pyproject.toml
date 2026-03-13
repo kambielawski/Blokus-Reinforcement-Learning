@@ -25,11 +25,11 @@ viz = [
 dev = [
     "pytest>=7.0.0",
 ]
-all = [
-    "blokus-alphazero[viz,dev]",
+train = [
+    "wandb>=0.15.0",
 ]
-rl = [
-    "torch>=2.0.0",
+all = [
+    "blokus-alphazero[viz,dev,train]",
 ]
 
 [tool.setuptools.packages.find]
