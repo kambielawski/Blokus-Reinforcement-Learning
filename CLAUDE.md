@@ -42,6 +42,8 @@ legacy/                          # Original codebase — reference only, not imp
   current_buffer.cpkl            # Saved replay buffer snapshot
   Piece Images.JPG               # Reference image of all Blokus pieces
 output/                          # Generated artifacts (gitignored — regenerate via scripts)
+slurm/                           # VACC Slurm job scripts
+  train_alphazero.sh             # GPU training (gpu-preempt, 1 GPU, 10 CPUs)
 configs/                         # Training configs (Phase 4 — empty)
 readme_ims/                      # Images used in README.md
 pyproject.toml                   # Project metadata, dependencies, pytest config
@@ -286,16 +288,37 @@ from blokus.agents import AlphaZeroAgent, self_play_game
 ## Self-Play & Training
 
 - `blokus/agents/alpha_zero.py` — `AlphaZeroAgent` (NN + MCTS) and `self_play_game()` function
-- `scripts/train.py` — Full training loop: self-play → collect examples → train network → iterate
+- `scripts/train.py` — Full training loop with multi-process self-play and W&B logging
 
 ### Running training
 
 ```bash
-# Quick test run (small network, few games)
-python scripts/train.py --iterations 5 --games-per-iter 2 --sims 25 --num-blocks 2 --channels 32
+# Quick test run (small network, few games, sequential)
+python scripts/train.py --iterations 5 --games-per-iter 2 --sims 25 --num-blocks 2 --channels 32 --num-workers 1
 
-# Full training
-python scripts/train.py --iterations 100 --games-per-iter 10 --sims 100
+# Full training with 4 parallel self-play workers + W&B logging
+python scripts/train.py --iterations 100 --games-per-iter 10 --sims 100 --num-workers 4 --wandb
+
+# Resume from checkpoint
+python scripts/train.py --iterations 50 --resume data/checkpoints/checkpoint_0100.pt --wandb
+```
+
+### Multi-process self-play
+
+`--num-workers N` runs N self-play games in parallel using `torch.multiprocessing` (spawn). Each worker gets its own model copy. Default is 4 workers. Use `--num-workers 1` for sequential mode.
+
+### W&B logging
+
+`--wandb` enables Weights & Biases tracking. Logs per-iteration losses, throughput (games/hr, examples/hr), cumulative totals, and all config params. Requires `pip install wandb`. Project name configurable via `--wandb-project`.
+
+### VACC training
+
+```bash
+# Default: 100 iters, 10 games/iter, 100 sims, 4 workers, W&B
+sbatch slurm/train_alphazero.sh
+
+# Custom args
+TRAIN_ARGS="--iterations 200 --sims 200 --num-workers 8" sbatch slurm/train_alphazero.sh
 ```
 
 Checkpoints saved to `data/checkpoints/` (gitignored).
