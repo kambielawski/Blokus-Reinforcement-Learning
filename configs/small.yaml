@@ -1,0 +1,16 @@
+# Small network for fast iteration and debugging
+
+network:
+  num_blocks: 2
+  channels: 32
+
+mcts:
+  num_simulations: 25
+
+training:
+  iterations: 10
+  epochs_per_iter: 3
+
+self_play:
+  games_per_iteration: 4
+  num_workers: 2

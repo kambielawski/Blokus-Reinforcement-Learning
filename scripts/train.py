@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """AlphaZero training loop for Blokus.
 
-Supports multi-process self-play for parallel game generation and optional
-Weights & Biases logging for experiment tracking.
+Supports YAML config files with CLI overrides, multi-process self-play,
+robust per-iteration checkpointing, and optional W&B logging.
 
 Usage:
-    python scripts/train.py [--iterations N] [--games-per-iter N] [--sims N]
-                            [--num-workers N] [--wandb] [--wandb-project NAME]
-                            [--lr LR] [--batch-size N] [--epochs N]
-                            [--device DEVICE] [--save-dir DIR]
+    # Use a config file
+    python scripts/train.py --config configs/full.yaml
+
+    # Override specific values
+    python scripts/train.py --config configs/full.yaml --lr 0.0005 --sims 200
+
+    # Pure CLI (uses configs/default.yaml as base)
+    python scripts/train.py --iterations 10 --games-per-iter 4 --sims 25
+
+    # Resume from latest checkpoint
+    python scripts/train.py --config configs/full.yaml --resume
 """
 
 import argparse
+import glob
 import os
 import sys
 import time
@@ -20,26 +28,181 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.multiprocessing as mp
 import numpy as np
-from typing import List
+import yaml
+from typing import List, Dict, Any, Optional
 
 # Add repo root to path for script execution
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
 
 from blokus.nn.network import BlokusNetwork
 from blokus.agents.alpha_zero import self_play_game, TrainingExample
 
 
 # ---------------------------------------------------------------------------
-# Self-play worker for multiprocessing
+# Configuration
+# ---------------------------------------------------------------------------
+
+def load_config(config_path: Optional[str]) -> Dict[str, Any]:
+    """Load YAML config, falling back to default.yaml if no path given."""
+    default_path = os.path.join(REPO_ROOT, 'configs', 'default.yaml')
+    with open(default_path) as f:
+        cfg = yaml.safe_load(f)
+
+    if config_path and os.path.abspath(config_path) != os.path.abspath(default_path):
+        with open(config_path) as f:
+            override = yaml.safe_load(f) or {}
+        _deep_merge(cfg, override)
+
+    return cfg
+
+
+def _deep_merge(base: dict, override: dict) -> None:
+    """Recursively merge override into base dict (mutates base)."""
+    for k, v in override.items():
+        if k in base and isinstance(base[k], dict) and isinstance(v, dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+
+
+def apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> None:
+    """Apply CLI argument overrides to the config dict."""
+    # Map flat CLI args to nested config paths
+    overrides = {
+        'iterations':      ('training', 'iterations'),
+        'games_per_iter':  ('self_play', 'games_per_iteration'),
+        'sims':            ('mcts', 'num_simulations'),
+        'lr':              ('training', 'learning_rate'),
+        'batch_size':      ('training', 'batch_size'),
+        'epochs':          ('training', 'epochs_per_iter'),
+        'num_blocks':      ('network', 'num_blocks'),
+        'channels':        ('network', 'channels'),
+        'game_mode':       ('self_play', 'game_mode'),
+        'device':          ('device',),
+        'save_dir':        ('checkpoint', 'dir'),
+        'num_workers':     ('self_play', 'num_workers'),
+        'wandb':           ('wandb', 'enabled'),
+        'wandb_project':   ('wandb', 'project'),
+        'wandb_run_name':  ('wandb', 'run_name'),
+        'c_puct':          ('mcts', 'c_puct'),
+        'max_moves':       ('self_play', 'max_moves'),
+    }
+    for arg_name, path in overrides.items():
+        val = getattr(args, arg_name, None)
+        if val is None:
+            continue
+        # For store_true args, only override if explicitly set
+        if isinstance(val, bool) and arg_name not in sys.argv:
+            # Check if --flag was explicitly passed
+            flag = f'--{arg_name.replace("_", "-")}'
+            if flag not in sys.argv and f'--{arg_name}' not in sys.argv:
+                continue
+
+        target = cfg
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = val
+
+
+# ---------------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------------
+
+class CheckpointManager:
+    """Manages saving/loading checkpoints with best-model tracking."""
+
+    def __init__(self, save_dir: str, save_every: int = 1, keep_top_k: int = 3):
+        self.save_dir = save_dir
+        self.save_every = save_every
+        self.keep_top_k = keep_top_k
+        os.makedirs(save_dir, exist_ok=True)
+
+    def save(self, iteration: int, network: nn.Module,
+             optimizer: optim.Optimizer, meta: Dict[str, Any],
+             cfg: Dict[str, Any]) -> Optional[str]:
+        """Save checkpoint if due. Always saves 'latest'. Returns path or None."""
+        if iteration % self.save_every != 0:
+            return None
+
+        payload = {
+            'iteration': iteration,
+            'model_state_dict': network.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'config': cfg,
+            **meta,
+        }
+
+        # Always save as 'latest'
+        latest_path = os.path.join(self.save_dir, 'checkpoint_latest.pt')
+        torch.save(payload, latest_path)
+
+        # Save numbered checkpoint
+        iter_path = os.path.join(self.save_dir, f'checkpoint_{iteration:04d}.pt')
+        torch.save(payload, iter_path)
+
+        return iter_path
+
+    def update_best(self, iteration: int, network: nn.Module,
+                    optimizer: optim.Optimizer, meta: Dict[str, Any],
+                    cfg: Dict[str, Any], policy_loss: float) -> None:
+        """Track top-K checkpoints by lowest policy loss."""
+        best_path = os.path.join(self.save_dir, 'best_models.yaml')
+        entries = []
+        if os.path.exists(best_path):
+            with open(best_path) as f:
+                entries = yaml.safe_load(f) or []
+
+        entry = {'iteration': iteration, 'policy_loss': float(policy_loss)}
+        entries.append(entry)
+        entries.sort(key=lambda e: e['policy_loss'])
+
+        # Keep top K
+        to_keep = set()
+        for e in entries[:self.keep_top_k]:
+            to_keep.add(e['iteration'])
+
+        # Remove checkpoints outside top K (but never remove 'latest')
+        for e in entries[self.keep_top_k:]:
+            old_path = os.path.join(self.save_dir, f'checkpoint_{e["iteration"]:04d}.pt')
+            if os.path.exists(old_path):
+                os.remove(old_path)
+
+        entries = entries[:self.keep_top_k]
+        with open(best_path, 'w') as f:
+            yaml.dump(entries, f)
+
+        # Save/update the best checkpoint file
+        if entries and entries[0]['iteration'] == iteration:
+            best_ckpt_path = os.path.join(self.save_dir, 'checkpoint_best.pt')
+            payload = {
+                'iteration': iteration,
+                'model_state_dict': network.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'config': cfg,
+                **meta,
+            }
+            torch.save(payload, best_ckpt_path)
+
+    def load_latest(self, device: torch.device) -> Optional[Dict[str, Any]]:
+        """Load the latest checkpoint if it exists."""
+        latest_path = os.path.join(self.save_dir, 'checkpoint_latest.pt')
+        if os.path.exists(latest_path):
+            return torch.load(latest_path, map_location=device, weights_only=False)
+        return None
+
+    def load(self, path: str, device: torch.device) -> Dict[str, Any]:
+        """Load a specific checkpoint."""
+        return torch.load(path, map_location=device, weights_only=False)
+
+
+# ---------------------------------------------------------------------------
+# Self-play (parallel)
 # ---------------------------------------------------------------------------
 
 def _self_play_worker(rank: int, model_state_dict: dict, config: dict,
                       result_queue: mp.Queue) -> None:
-    """Worker process that plays one self-play game and puts examples in queue.
-
-    Each worker creates its own model copy on the target device. For CUDA,
-    PyTorch handles concurrent access across processes automatically.
-    """
+    """Worker process that plays one self-play game."""
     device = torch.device(config['device'])
     network = BlokusNetwork(
         num_blocks=config['num_blocks'],
@@ -52,6 +215,9 @@ def _self_play_worker(rank: int, model_state_dict: dict, config: dict,
         network=network,
         game_mode=config['game_mode'],
         num_simulations=config['sims'],
+        c_puct=config['c_puct'],
+        temp_threshold=config['temp_threshold_move'],
+        max_moves=config['max_moves'],
         device=device,
     )
     result_queue.put(examples)
@@ -60,18 +226,7 @@ def _self_play_worker(rank: int, model_state_dict: dict, config: dict,
 def run_self_play_parallel(network: BlokusNetwork, num_games: int,
                            num_workers: int, config: dict
                            ) -> List[TrainingExample]:
-    """Run self-play games in parallel using multiple worker processes.
-
-    Args:
-        network: Current network (weights copied to each worker).
-        num_games: Total number of games to play.
-        num_workers: Number of parallel worker processes.
-        config: Dict with 'device', 'game_mode', 'sims', 'num_blocks', 'channels'.
-
-    Returns:
-        Combined list of TrainingExample from all games.
-    """
-    # Share model weights (CPU tensors for cross-process transfer)
+    """Run self-play games in parallel using multiple worker processes."""
     model_state = {k: v.cpu() for k, v in network.state_dict().items()}
 
     ctx = mp.get_context('spawn')
@@ -81,9 +236,7 @@ def run_self_play_parallel(network: BlokusNetwork, num_games: int,
     games_launched = 0
     games_collected = 0
 
-    # Launch games in waves of num_workers
     while games_collected < num_games:
-        # Launch up to num_workers processes
         batch = min(num_workers, num_games - games_launched)
         processes = []
         for i in range(batch):
@@ -95,7 +248,6 @@ def run_self_play_parallel(network: BlokusNetwork, num_games: int,
             processes.append(p)
         games_launched += batch
 
-        # Collect results from this wave
         for _ in range(batch):
             examples = result_queue.get()
             all_examples.extend(examples)
@@ -103,10 +255,33 @@ def run_self_play_parallel(network: BlokusNetwork, num_games: int,
             print(f"  Game {games_collected}/{num_games}: "
                   f"{len(examples)} examples", flush=True)
 
-        # Ensure all processes have exited
         for p in processes:
             p.join()
 
+    return all_examples
+
+
+def run_self_play_sequential(network: BlokusNetwork, num_games: int,
+                             cfg: Dict[str, Any], device: torch.device
+                             ) -> List[TrainingExample]:
+    """Run self-play games sequentially."""
+    all_examples: List[TrainingExample] = []
+    for game_idx in range(num_games):
+        print(f"  Self-play game {game_idx+1}/{num_games}...",
+              end='', flush=True)
+        t0 = time.time()
+        examples = self_play_game(
+            network=network,
+            game_mode=cfg['self_play']['game_mode'],
+            num_simulations=cfg['mcts']['num_simulations'],
+            c_puct=cfg['mcts']['c_puct'],
+            temp_threshold=cfg['mcts']['temp_threshold_move'],
+            max_moves=cfg['self_play']['max_moves'],
+            device=device,
+        )
+        dt = time.time() - t0
+        print(f" {len(examples)} examples in {dt:.1f}s")
+        all_examples.extend(examples)
     return all_examples
 
 
@@ -121,15 +296,12 @@ def train_on_examples(network: BlokusNetwork,
                       epochs: int = 5,
                       device: torch.device = torch.device('cpu')
                       ) -> dict:
-    """Train the network on a batch of self-play examples.
+    """Train the network on self-play examples.
 
     Loss = MSE(value_pred, value_target) + CE(policy_pred, policy_target)
-
-    Returns dict with loss statistics.
     """
     network.train()
 
-    # Stack all examples into tensors
     board_states = torch.from_numpy(
         np.stack([ex.board_state for ex in examples])
     ).to(device)
@@ -152,7 +324,6 @@ def train_on_examples(network: BlokusNetwork,
     total_batches = 0
 
     for epoch in range(epochs):
-        # Shuffle
         perm = torch.randperm(n)
         board_states = board_states[perm]
         pieces_vecs = pieces_vecs[perm]
@@ -169,16 +340,9 @@ def train_on_examples(network: BlokusNetwork,
             vt = value_targets[i:end]
 
             optimizer.zero_grad()
-
             log_policy, value_pred = network(bs, pv, lm)
-
-            # Policy loss: cross-entropy with MCTS visit distribution
-            # -sum(pi * log(p)) where pi is the target distribution
             policy_loss = -torch.sum(pt * log_policy) / bs.size(0)
-
-            # Value loss: MSE
             value_loss = nn.functional.mse_loss(value_pred, vt)
-
             loss = policy_loss + value_loss
             loss.backward()
             optimizer.step()
@@ -202,238 +366,235 @@ def train_on_examples(network: BlokusNetwork,
 
 def main():
     parser = argparse.ArgumentParser(description='Blokus AlphaZero Training')
-    parser.add_argument('--iterations', type=int, default=10,
-                        help='Number of training iterations')
-    parser.add_argument('--games-per-iter', type=int, default=4,
-                        help='Self-play games per iteration')
-    parser.add_argument('--sims', type=int, default=50,
-                        help='MCTS simulations per move')
-    parser.add_argument('--lr', type=float, default=1e-3,
-                        help='Learning rate')
-    parser.add_argument('--batch-size', type=int, default=64,
-                        help='Training batch size')
-    parser.add_argument('--epochs', type=int, default=5,
-                        help='Training epochs per iteration')
-    parser.add_argument('--num-blocks', type=int, default=5,
-                        help='Number of residual blocks')
-    parser.add_argument('--channels', type=int, default=128,
-                        help='Number of backbone channels')
-    parser.add_argument('--game-mode', type=str, default='dual',
-                        choices=['standard', 'dual'],
-                        help='Game mode for self-play')
-    parser.add_argument('--device', type=str, default=None,
-                        help='Device (cpu/mps/cuda)')
-    parser.add_argument('--save-dir', type=str, default='data/checkpoints',
-                        help='Directory for saving checkpoints')
-    parser.add_argument('--num-workers', type=int, default=4,
-                        help='Number of parallel self-play workers (1=sequential)')
-    parser.add_argument('--wandb', action='store_true',
-                        help='Enable Weights & Biases logging')
-    parser.add_argument('--wandb-project', type=str, default='blokus-alphazero',
-                        help='W&B project name')
-    parser.add_argument('--wandb-run-name', type=str, default=None,
-                        help='W&B run name (auto-generated if not set)')
-    parser.add_argument('--resume', type=str, default=None,
-                        help='Path to checkpoint to resume from')
+    parser.add_argument('--config', type=str, default=None,
+                        help='Path to YAML config file')
+    parser.add_argument('--resume', nargs='?', const='latest', default=None,
+                        help='Resume from checkpoint (default: latest, or specify path)')
+    # CLI overrides (all optional — config file provides defaults)
+    parser.add_argument('--iterations', type=int, default=None)
+    parser.add_argument('--games-per-iter', type=int, default=None, dest='games_per_iter')
+    parser.add_argument('--sims', type=int, default=None)
+    parser.add_argument('--lr', type=float, default=None)
+    parser.add_argument('--batch-size', type=int, default=None, dest='batch_size')
+    parser.add_argument('--epochs', type=int, default=None)
+    parser.add_argument('--num-blocks', type=int, default=None, dest='num_blocks')
+    parser.add_argument('--channels', type=int, default=None)
+    parser.add_argument('--game-mode', type=str, default=None, dest='game_mode',
+                        choices=['standard', 'dual'])
+    parser.add_argument('--device', type=str, default=None)
+    parser.add_argument('--save-dir', type=str, default=None, dest='save_dir')
+    parser.add_argument('--num-workers', type=int, default=None, dest='num_workers')
+    parser.add_argument('--wandb', action='store_true', default=None)
+    parser.add_argument('--wandb-project', type=str, default=None, dest='wandb_project')
+    parser.add_argument('--wandb-run-name', type=str, default=None, dest='wandb_run_name')
+    parser.add_argument('--c-puct', type=float, default=None, dest='c_puct')
+    parser.add_argument('--max-moves', type=int, default=None, dest='max_moves')
     args = parser.parse_args()
 
-    # Auto-detect device
-    if args.device:
-        device = torch.device(args.device)
-    elif torch.cuda.is_available():
-        device = torch.device('cuda')
-    elif torch.backends.mps.is_available():
-        device = torch.device('mps')
+    # Load config
+    cfg = load_config(args.config)
+    apply_cli_overrides(cfg, args)
+
+    # Resolve device
+    device_str = cfg['device']
+    if device_str == 'auto':
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            device = torch.device('mps')
+        else:
+            device = torch.device('cpu')
     else:
-        device = torch.device('cpu')
+        device = torch.device(device_str)
     print(f"Using device: {device}")
 
     # Create network
     network = BlokusNetwork(
-        num_blocks=args.num_blocks,
-        channels=args.channels,
+        num_blocks=cfg['network']['num_blocks'],
+        channels=cfg['network']['channels'],
     ).to(device)
 
     param_count = sum(p.numel() for p in network.parameters())
-    print(f"Network: {args.num_blocks} res blocks, {args.channels} channels, "
-          f"{param_count:,} parameters")
+    print(f"Network: {cfg['network']['num_blocks']} res blocks, "
+          f"{cfg['network']['channels']} channels, {param_count:,} parameters")
 
-    optimizer = optim.Adam(network.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = optim.Adam(
+        network.parameters(),
+        lr=cfg['training']['learning_rate'],
+        weight_decay=cfg['training']['weight_decay'],
+    )
+
+    # Checkpoint manager
+    ckpt_mgr = CheckpointManager(
+        save_dir=cfg['checkpoint']['dir'],
+        save_every=cfg['checkpoint']['save_every_n_iters'],
+        keep_top_k=cfg['checkpoint']['keep_top_k'],
+    )
 
     start_iteration = 1
     cumulative_games = 0
     cumulative_examples = 0
+    loss_history: List[Dict[str, float]] = []
 
-    # Resume from checkpoint if specified
+    # Resume
     if args.resume:
-        print(f"Resuming from {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        network.load_state_dict(ckpt['model_state_dict'])
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        start_iteration = ckpt.get('iteration', 0) + 1
-        cumulative_games = ckpt.get('cumulative_games', 0)
-        cumulative_examples = ckpt.get('cumulative_examples', 0)
-        print(f"  Resumed at iteration {start_iteration}, "
-              f"{cumulative_games} games, {cumulative_examples} examples")
+        if args.resume == 'latest':
+            ckpt = ckpt_mgr.load_latest(device)
+        else:
+            ckpt = ckpt_mgr.load(args.resume, device)
 
-    # Create save directory
-    os.makedirs(args.save_dir, exist_ok=True)
+        if ckpt:
+            network.load_state_dict(ckpt['model_state_dict'])
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            start_iteration = ckpt.get('iteration', 0) + 1
+            cumulative_games = ckpt.get('cumulative_games', 0)
+            cumulative_examples = ckpt.get('cumulative_examples', 0)
+            loss_history = ckpt.get('loss_history', [])
+            print(f"Resumed from iteration {start_iteration - 1}: "
+                  f"{cumulative_games} games, {cumulative_examples} examples")
+        else:
+            print("No checkpoint found — starting from scratch")
 
-    # --- W&B setup ---
+    # W&B setup
     wandb_run = None
-    if args.wandb:
+    if cfg['wandb']['enabled']:
         try:
             import wandb
             wandb_run = wandb.init(
-                project=args.wandb_project,
-                name=args.wandb_run_name,
-                config={
-                    'iterations': args.iterations,
-                    'games_per_iter': args.games_per_iter,
-                    'sims': args.sims,
-                    'lr': args.lr,
-                    'batch_size': args.batch_size,
-                    'epochs': args.epochs,
-                    'num_blocks': args.num_blocks,
-                    'channels': args.channels,
-                    'game_mode': args.game_mode,
-                    'device': str(device),
-                    'num_workers': args.num_workers,
-                    'param_count': param_count,
-                },
+                project=cfg['wandb']['project'],
+                name=cfg['wandb']['run_name'],
+                config=cfg,
                 resume='allow',
             )
             print(f"W&B run: {wandb_run.url}")
         except ImportError:
             print("WARNING: wandb not installed, logging disabled")
-            args.wandb = False
+            cfg['wandb']['enabled'] = False
 
-    # Config dict for workers
+    # Worker config for parallel self-play
     worker_config = {
         'device': str(device),
-        'game_mode': args.game_mode,
-        'sims': args.sims,
-        'num_blocks': args.num_blocks,
-        'channels': args.channels,
+        'game_mode': cfg['self_play']['game_mode'],
+        'sims': cfg['mcts']['num_simulations'],
+        'c_puct': cfg['mcts']['c_puct'],
+        'temp_threshold_move': cfg['mcts']['temp_threshold_move'],
+        'max_moves': cfg['self_play']['max_moves'],
+        'num_blocks': cfg['network']['num_blocks'],
+        'channels': cfg['network']['channels'],
     }
 
-    use_parallel = args.num_workers > 1
+    num_workers = cfg['self_play']['num_workers']
+    use_parallel = num_workers > 1
     if use_parallel:
-        print(f"Self-play: {args.num_workers} parallel workers")
-        # Required for CUDA multiprocessing
+        print(f"Self-play: {num_workers} parallel workers")
         if device.type == 'cuda':
             mp.set_start_method('spawn', force=True)
     else:
         print("Self-play: sequential (1 worker)")
 
+    total_iterations = cfg['training']['iterations']
+    end_iteration = start_iteration + total_iterations - 1
+
+    # Print config summary
+    print(f"\nConfig: {total_iterations} iterations, "
+          f"{cfg['self_play']['games_per_iteration']} games/iter, "
+          f"{cfg['mcts']['num_simulations']} sims, "
+          f"lr={cfg['training']['learning_rate']}")
+
     # Training loop
-    end_iteration = start_iteration + args.iterations - 1
     for iteration in range(start_iteration, end_iteration + 1):
         print(f"\n{'='*60}")
         print(f"Iteration {iteration}/{end_iteration}")
         print(f"{'='*60}")
 
-        # ------ Self-play phase ------
-        t_sp_start = time.time()
+        # ------ Self-play ------
+        t_sp = time.time()
+        games_this_iter = cfg['self_play']['games_per_iteration']
 
         if use_parallel:
             all_examples = run_self_play_parallel(
                 network=network,
-                num_games=args.games_per_iter,
-                num_workers=args.num_workers,
+                num_games=games_this_iter,
+                num_workers=num_workers,
                 config=worker_config,
             )
         else:
-            all_examples: List[TrainingExample] = []
-            for game_idx in range(args.games_per_iter):
-                print(f"  Self-play game {game_idx+1}/{args.games_per_iter}...",
-                      end='', flush=True)
-                game_t0 = time.time()
-                examples = self_play_game(
-                    network=network,
-                    game_mode=args.game_mode,
-                    num_simulations=args.sims,
-                    device=device,
-                )
-                game_dt = time.time() - game_t0
-                print(f" {len(examples)} examples in {game_dt:.1f}s")
-                all_examples.extend(examples)
+            all_examples = run_self_play_sequential(
+                network=network,
+                num_games=games_this_iter,
+                cfg=cfg,
+                device=device,
+            )
 
-        sp_time = time.time() - t_sp_start
-        iter_games = args.games_per_iter
+        sp_time = time.time() - t_sp
         iter_examples = len(all_examples)
-        cumulative_games += iter_games
+        cumulative_games += games_this_iter
         cumulative_examples += iter_examples
+        games_per_hour = games_this_iter / sp_time * 3600 if sp_time > 0 else 0
+        examples_per_hour = iter_examples / sp_time * 3600 if sp_time > 0 else 0
         print(f"  Self-play: {iter_examples} examples in {sp_time:.1f}s "
-              f"({iter_games/sp_time*3600:.0f} games/hr)")
+              f"({games_per_hour:.0f} games/hr)")
 
-        # ------ Training phase ------
-        t_tr_start = time.time()
+        # ------ Training ------
+        t_tr = time.time()
         stats = train_on_examples(
             network=network,
             examples=all_examples,
             optimizer=optimizer,
-            batch_size=args.batch_size,
-            epochs=args.epochs,
+            batch_size=cfg['training']['batch_size'],
+            epochs=cfg['training']['epochs_per_iter'],
             device=device,
         )
-        train_time = time.time() - t_tr_start
+        train_time = time.time() - t_tr
         total_iter_time = sp_time + train_time
+
+        loss_entry = {
+            'iteration': iteration,
+            'policy_loss': stats['policy_loss'],
+            'value_loss': stats['value_loss'],
+            'total_loss': stats['total_loss'],
+        }
+        loss_history.append(loss_entry)
 
         print(f"  Training: policy_loss={stats['policy_loss']:.4f}, "
               f"value_loss={stats['value_loss']:.4f}, "
               f"total_loss={stats['total_loss']:.4f} "
               f"({train_time:.1f}s)")
 
-        # ------ W&B logging ------
-        if args.wandb and wandb_run:
+        # ------ Checkpoint ------
+        meta = {
+            'cumulative_games': cumulative_games,
+            'cumulative_examples': cumulative_examples,
+            'loss_history': loss_history,
+            'stats': stats,
+        }
+        ckpt_path = ckpt_mgr.save(iteration, network, optimizer, meta, cfg)
+        if ckpt_path:
+            print(f"  Checkpoint: {ckpt_path}")
+        ckpt_mgr.update_best(iteration, network, optimizer, meta, cfg,
+                             stats['policy_loss'])
+
+        # ------ W&B ------
+        if cfg['wandb']['enabled'] and wandb_run:
             import wandb
-            games_per_hour = iter_games / sp_time * 3600 if sp_time > 0 else 0
-            examples_per_hour = iter_examples / sp_time * 3600 if sp_time > 0 else 0
             wandb.log({
                 'iteration': iteration,
-                # Losses
                 'policy_loss': stats['policy_loss'],
                 'value_loss': stats['value_loss'],
                 'total_loss': stats['total_loss'],
-                # Per-iteration stats
-                'iter_games': iter_games,
+                'iter_games': games_this_iter,
                 'iter_examples': iter_examples,
                 'self_play_time_s': sp_time,
                 'train_time_s': train_time,
                 'total_iter_time_s': total_iter_time,
-                # Throughput
                 'games_per_hour': games_per_hour,
                 'examples_per_hour': examples_per_hour,
-                # Cumulative
                 'games_played': cumulative_games,
                 'training_examples': cumulative_examples,
             }, step=iteration)
 
-        # ------ Save checkpoint ------
-        if iteration % 5 == 0 or iteration == end_iteration:
-            ckpt_path = os.path.join(args.save_dir, f'checkpoint_{iteration:04d}.pt')
-            torch.save({
-                'iteration': iteration,
-                'model_state_dict': network.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'stats': stats,
-                'cumulative_games': cumulative_games,
-                'cumulative_examples': cumulative_examples,
-            }, ckpt_path)
-            print(f"  Saved checkpoint: {ckpt_path}")
-
-    # Save final model
-    final_path = os.path.join(args.save_dir, 'model_latest.pt')
-    torch.save({
-        'iteration': end_iteration,
-        'model_state_dict': network.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'cumulative_games': cumulative_games,
-        'cumulative_examples': cumulative_examples,
-    }, final_path)
-    print(f"\nTraining complete. Final model saved to {final_path}")
-    print(f"Total: {cumulative_games} games, {cumulative_examples} examples")
+    print(f"\nTraining complete: {cumulative_games} games, "
+          f"{cumulative_examples} examples over {total_iterations} iterations")
 
     if wandb_run:
         wandb_run.finish()

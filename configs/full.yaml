@@ -1,0 +1,23 @@
+# Full-size network for real training runs
+
+network:
+  num_blocks: 5
+  channels: 128
+
+mcts:
+  num_simulations: 100
+
+training:
+  learning_rate: 0.001
+  batch_size: 64
+  epochs_per_iter: 5
+  iterations: 100
+
+self_play:
+  games_per_iteration: 10
+  num_workers: 4
+
+wandb:
+  enabled: true
+
+device: auto

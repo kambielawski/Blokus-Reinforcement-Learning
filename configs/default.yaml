@@ -1,0 +1,40 @@
+# Blokus AlphaZero — Default Configuration
+# All hyperparameters in one place. CLI args override these values.
+
+network:
+  num_blocks: 5
+  channels: 128
+
+mcts:
+  num_simulations: 100
+  c_puct: 1.5
+  dirichlet_alpha: 0.3
+  dirichlet_epsilon: 0.25
+  temperature: 1.0
+  temp_threshold_move: 15       # Switch to greedy after this many moves
+  batch_size: 8                 # Leaves batched per NN call
+
+training:
+  learning_rate: 0.001
+  batch_size: 64
+  epochs_per_iter: 5
+  weight_decay: 0.0001
+  iterations: 100
+
+self_play:
+  games_per_iteration: 10
+  num_workers: 4                # Parallel self-play workers (1 = sequential)
+  max_moves: 0                  # 0 = play to completion
+  game_mode: dual               # 'dual' (1v1) or 'standard' (4-player)
+
+checkpoint:
+  dir: data/checkpoints
+  save_every_n_iters: 1         # Save after every N iterations
+  keep_top_k: 3                 # Keep top K checkpoints by lowest policy loss
+
+wandb:
+  enabled: false
+  project: blokus-alphazero
+  run_name: null                # null = auto-generated
+
+device: auto                    # auto / cpu / cuda / mps
