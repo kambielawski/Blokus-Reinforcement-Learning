@@ -12,6 +12,7 @@ training:
   batch_size: 64
   epochs_per_iter: 5
   iterations: 100
+  replay_buffer_size: 50000
 
 self_play:
   games_per_iteration: 10

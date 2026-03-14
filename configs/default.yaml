@@ -20,6 +20,7 @@ training:
   epochs_per_iter: 5
   weight_decay: 0.0001
   iterations: 100
+  replay_buffer_size: 30000       # Max examples in rolling buffer (0 = no buffer)
 
 self_play:
   games_per_iteration: 10

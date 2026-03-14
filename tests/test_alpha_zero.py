@@ -322,6 +322,96 @@ class TestSelfPlay:
 # Training Tests
 # ---------------------------------------------------------------------------
 
+class TestReplayBuffer:
+    """Tests for the replay buffer."""
+
+    @pytest.fixture
+    def train_module(self):
+        import sys, os
+        sys.path.insert(0, os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'scripts',
+        ))
+        import train
+        return train
+
+    @pytest.fixture
+    def make_examples(self):
+        """Create dummy TrainingExample objects."""
+        def _make(n, value=0.5):
+            examples = []
+            for i in range(n):
+                examples.append(TrainingExample(
+                    board_state=np.zeros((5, 20, 20), dtype=np.float32),
+                    pieces_remaining=np.ones(84, dtype=np.float32),
+                    legal_mask=np.ones(ACTION_SPACE_SIZE, dtype=np.float32),
+                    policy_target=np.full(ACTION_SPACE_SIZE, 1.0 / ACTION_SPACE_SIZE,
+                                          dtype=np.float32),
+                    value_target=value,
+                ))
+            return examples
+        return _make
+
+    def test_buffer_accumulates(self, train_module, make_examples):
+        """Buffer should accumulate examples across multiple adds."""
+        buf = train_module.ReplayBuffer(max_size=1000)
+        buf.add(make_examples(100))
+        assert len(buf) == 100
+        buf.add(make_examples(200))
+        assert len(buf) == 300
+        buf.add(make_examples(50))
+        assert len(buf) == 350
+
+    def test_buffer_drops_oldest(self, train_module, make_examples):
+        """Buffer should drop oldest examples when exceeding max_size."""
+        buf = train_module.ReplayBuffer(max_size=200)
+        batch1 = make_examples(150, value=0.1)
+        batch2 = make_examples(100, value=0.9)
+        buf.add(batch1)
+        assert len(buf) == 150
+        dropped = buf.add(batch2)
+        assert len(buf) == 200
+        assert dropped == 50
+        # Oldest examples (value=0.1) should have been partially dropped,
+        # newest (value=0.9) should all be present
+        values = [ex.value_target for ex in buf.get_all()]
+        assert values[-1] == 0.9  # last added is newest
+        assert values[0] == 0.1   # some old ones remain
+
+    def test_buffer_checkpoint_roundtrip(self, train_module, make_examples):
+        """Buffer state_dict/load_state_dict should preserve contents."""
+        buf = train_module.ReplayBuffer(max_size=500)
+        examples = make_examples(100, value=0.42)
+        buf.add(examples)
+
+        state = buf.state_dict()
+        buf2 = train_module.ReplayBuffer(max_size=100)  # different max_size
+        buf2.load_state_dict(state)
+
+        assert len(buf2) == 100
+        assert buf2.max_size == 500  # restored from state
+        for ex in buf2.get_all():
+            assert ex.value_target == pytest.approx(0.42)
+            assert ex.board_state.shape == (5, 20, 20)
+
+    def test_buffer_empty_checkpoint(self, train_module):
+        """Empty buffer should serialize/deserialize cleanly."""
+        buf = train_module.ReplayBuffer(max_size=100)
+        state = buf.state_dict()
+        buf2 = train_module.ReplayBuffer(max_size=100)
+        buf2.load_state_dict(state)
+        assert len(buf2) == 0
+
+    def test_buffer_sample(self, train_module, make_examples):
+        """Sampling should return the requested number of examples."""
+        buf = train_module.ReplayBuffer(max_size=1000)
+        buf.add(make_examples(500))
+        sample = buf.sample(64)
+        assert len(sample) == 64
+        for ex in sample:
+            assert isinstance(ex, TrainingExample)
+
+
 class TestTraining:
     """Tests for the training loop."""
 

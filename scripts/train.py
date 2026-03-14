@@ -87,6 +87,7 @@ def apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> None:
         'wandb_run_name':  ('wandb', 'run_name'),
         'c_puct':          ('mcts', 'c_puct'),
         'max_moves':       ('self_play', 'max_moves'),
+        'buffer_size':     ('training', 'replay_buffer_size'),
     }
     for arg_name, path in overrides.items():
         val = getattr(args, arg_name, None)
@@ -194,6 +195,79 @@ class CheckpointManager:
     def load(self, path: str, device: torch.device) -> Dict[str, Any]:
         """Load a specific checkpoint."""
         return torch.load(path, map_location=device, weights_only=False)
+
+
+# ---------------------------------------------------------------------------
+# Replay Buffer
+# ---------------------------------------------------------------------------
+
+class ReplayBuffer:
+    """Rolling FIFO buffer that stores training examples across iterations.
+
+    New examples are appended each iteration. When the buffer exceeds
+    max_size, the oldest examples are dropped.
+    """
+
+    def __init__(self, max_size: int):
+        self.max_size = max_size
+        self.buffer: List[TrainingExample] = []
+
+    def add(self, examples: List[TrainingExample]) -> int:
+        """Add examples to the buffer, dropping oldest if over capacity.
+
+        Returns the number of examples dropped.
+        """
+        self.buffer.extend(examples)
+        dropped = 0
+        if len(self.buffer) > self.max_size:
+            dropped = len(self.buffer) - self.max_size
+            self.buffer = self.buffer[dropped:]
+        return dropped
+
+    def sample(self, n: int) -> List[TrainingExample]:
+        """Sample n examples uniformly at random (with replacement if n > len)."""
+        if not self.buffer:
+            return []
+        indices = np.random.randint(0, len(self.buffer), size=min(n, len(self.buffer)))
+        return [self.buffer[i] for i in indices]
+
+    def get_all(self) -> List[TrainingExample]:
+        """Return all examples in the buffer."""
+        return self.buffer
+
+    def __len__(self) -> int:
+        return len(self.buffer)
+
+    def state_dict(self) -> dict:
+        """Serialize buffer contents for checkpointing."""
+        if not self.buffer:
+            return {'examples': [], 'max_size': self.max_size}
+        return {
+            'max_size': self.max_size,
+            'board_states': np.stack([ex.board_state for ex in self.buffer]),
+            'pieces_remaining': np.stack([ex.pieces_remaining for ex in self.buffer]),
+            'legal_masks': np.stack([ex.legal_mask for ex in self.buffer]),
+            'policy_targets': np.stack([ex.policy_target for ex in self.buffer]),
+            'value_targets': np.array([ex.value_target for ex in self.buffer],
+                                      dtype=np.float32),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore buffer from checkpoint."""
+        if 'board_states' not in state:
+            self.buffer = []
+            return
+        self.max_size = state['max_size']
+        n = len(state['value_targets'])
+        self.buffer = []
+        for i in range(n):
+            self.buffer.append(TrainingExample(
+                board_state=state['board_states'][i],
+                pieces_remaining=state['pieces_remaining'][i],
+                legal_mask=state['legal_masks'][i],
+                policy_target=state['policy_targets'][i],
+                value_target=float(state['value_targets'][i]),
+            ))
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +463,7 @@ def main():
     parser.add_argument('--wandb-run-name', type=str, default=None, dest='wandb_run_name')
     parser.add_argument('--c-puct', type=float, default=None, dest='c_puct')
     parser.add_argument('--max-moves', type=int, default=None, dest='max_moves')
+    parser.add_argument('--buffer-size', type=int, default=None, dest='buffer_size')
     args = parser.parse_args()
 
     # Load config
@@ -431,6 +506,11 @@ def main():
         keep_top_k=cfg['checkpoint']['keep_top_k'],
     )
 
+    # Replay buffer
+    buffer_size = cfg['training'].get('replay_buffer_size', 30000)
+    replay_buffer = ReplayBuffer(max_size=buffer_size)
+    print(f"Replay buffer: capacity {buffer_size}")
+
     start_iteration = 1
     cumulative_games = 0
     cumulative_examples = 0
@@ -450,8 +530,16 @@ def main():
             cumulative_games = ckpt.get('cumulative_games', 0)
             cumulative_examples = ckpt.get('cumulative_examples', 0)
             loss_history = ckpt.get('loss_history', [])
-            print(f"Resumed from iteration {start_iteration - 1}: "
-                  f"{cumulative_games} games, {cumulative_examples} examples")
+            # Restore replay buffer
+            if 'replay_buffer' in ckpt:
+                replay_buffer.load_state_dict(ckpt['replay_buffer'])
+                print(f"Resumed from iteration {start_iteration - 1}: "
+                      f"{cumulative_games} games, {cumulative_examples} examples, "
+                      f"{len(replay_buffer)} examples in buffer")
+            else:
+                print(f"Resumed from iteration {start_iteration - 1}: "
+                      f"{cumulative_games} games, {cumulative_examples} examples "
+                      f"(no replay buffer in checkpoint)")
         else:
             print("No checkpoint found — starting from scratch")
 
@@ -535,11 +623,32 @@ def main():
         print(f"  Self-play: {iter_examples} examples in {sp_time:.1f}s "
               f"({games_per_hour:.0f} games/hr)")
 
-        # ------ Training ------
+        # ------ Add to replay buffer ------
+        dropped = replay_buffer.add(all_examples)
+        buf_len = len(replay_buffer)
+        print(f"  Buffer: {buf_len}/{buffer_size} examples"
+              f"{f' (dropped {dropped} oldest)' if dropped else ''}")
+
+        # ------ Value target diagnostics ------
+        value_targets = np.array([ex.value_target for ex in replay_buffer.get_all()],
+                                 dtype=np.float32)
+        vt_mean = float(value_targets.mean())
+        vt_std = float(value_targets.std())
+        vt_min = float(value_targets.min())
+        vt_max = float(value_targets.max())
+        # Also check current iteration's targets
+        iter_vt = np.array([ex.value_target for ex in all_examples], dtype=np.float32)
+        iter_vt_mean = float(iter_vt.mean())
+        iter_vt_std = float(iter_vt.std())
+        print(f"  Value targets (buffer): mean={vt_mean:+.4f}, std={vt_std:.4f}, "
+              f"range=[{vt_min:+.3f}, {vt_max:+.3f}]")
+        print(f"  Value targets (iter):   mean={iter_vt_mean:+.4f}, std={iter_vt_std:.4f}")
+
+        # ------ Training (on full buffer) ------
         t_tr = time.time()
         stats = train_on_examples(
             network=network,
-            examples=all_examples,
+            examples=replay_buffer.get_all(),
             optimizer=optimizer,
             batch_size=cfg['training']['batch_size'],
             epochs=cfg['training']['epochs_per_iter'],
@@ -567,6 +676,7 @@ def main():
             'cumulative_examples': cumulative_examples,
             'loss_history': loss_history,
             'stats': stats,
+            'replay_buffer': replay_buffer.state_dict(),
         }
         ckpt_path = ckpt_mgr.save(iteration, network, optimizer, meta, cfg)
         if ckpt_path:
@@ -591,6 +701,14 @@ def main():
                 'examples_per_hour': examples_per_hour,
                 'games_played': cumulative_games,
                 'training_examples': cumulative_examples,
+                'buffer_size': buf_len,
+                'buffer_capacity': buffer_size,
+                'value_target_mean': vt_mean,
+                'value_target_std': vt_std,
+                'value_target_min': vt_min,
+                'value_target_max': vt_max,
+                'iter_value_target_mean': iter_vt_mean,
+                'iter_value_target_std': iter_vt_std,
             }, step=iteration)
 
     print(f"\nTraining complete: {cumulative_games} games, "
