@@ -354,8 +354,8 @@ class MCTS:
         else:
             priors[:] = 1.0 / len(legal)
 
-        # Add Dirichlet noise at root
-        if add_noise and len(legal) > 0:
+        # Add Dirichlet noise at root (skip if alpha <= 0)
+        if add_noise and len(legal) > 0 and self.dirichlet_alpha > 0:
             noise = np.random.dirichlet(
                 [self.dirichlet_alpha] * len(legal)
             )
