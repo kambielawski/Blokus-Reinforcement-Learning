@@ -131,7 +131,7 @@ from blokus.engine.game_state import (
 | `get_current_agent()` | Current agent index (0-3 standard, 0-1 dual) |
 | `get_num_agents()` | 4 (standard) or 2 (dual) |
 | `get_scores()` | `{color_idx: num_squares_on_board}` |
-| `get_rewards()` | `{agent_idx: float in [-1, 1]}` normalized rewards |
+| `get_rewards()` | `{agent_idx: float in {-1, 0, +1}}` win/loss/draw rewards |
 | `get_nn_state()` | `(5, 20, 20)` float32 tensor for NN input |
 | `render_text()` | ASCII board string |
 | `render_image(cell_size=24)` | RGB `(H, W, 3)` uint8 numpy array |
