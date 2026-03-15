@@ -88,6 +88,7 @@ def apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> None:
         'c_puct':          ('mcts', 'c_puct'),
         'max_moves':       ('self_play', 'max_moves'),
         'buffer_size':     ('training', 'replay_buffer_size'),
+        'value_loss_weight': ('training', 'value_loss_weight'),
     }
     for arg_name, path in overrides.items():
         val = getattr(args, arg_name, None)
@@ -368,11 +369,12 @@ def train_on_examples(network: BlokusNetwork,
                       optimizer: optim.Optimizer,
                       batch_size: int = 64,
                       epochs: int = 5,
+                      value_loss_weight: float = 1.0,
                       device: torch.device = torch.device('cpu')
                       ) -> dict:
     """Train the network on self-play examples.
 
-    Loss = MSE(value_pred, value_target) + CE(policy_pred, policy_target)
+    Loss = policy_loss + value_loss_weight * MSE(value_pred, value_target)
     """
     network.train()
 
@@ -417,7 +419,7 @@ def train_on_examples(network: BlokusNetwork,
             log_policy, value_pred = network(bs, pv, lm)
             policy_loss = -torch.sum(pt * log_policy) / bs.size(0)
             value_loss = nn.functional.mse_loss(value_pred, vt)
-            loss = policy_loss + value_loss
+            loss = policy_loss + value_loss_weight * value_loss
             loss.backward()
             optimizer.step()
 
@@ -464,6 +466,7 @@ def main():
     parser.add_argument('--c-puct', type=float, default=None, dest='c_puct')
     parser.add_argument('--max-moves', type=int, default=None, dest='max_moves')
     parser.add_argument('--buffer-size', type=int, default=None, dest='buffer_size')
+    parser.add_argument('--value-loss-weight', type=float, default=None, dest='value_loss_weight')
     args = parser.parse_args()
 
     # Load config
@@ -652,6 +655,7 @@ def main():
             optimizer=optimizer,
             batch_size=cfg['training']['batch_size'],
             epochs=cfg['training']['epochs_per_iter'],
+            value_loss_weight=cfg['training'].get('value_loss_weight', 1.0),
             device=device,
         )
         train_time = time.time() - t_tr

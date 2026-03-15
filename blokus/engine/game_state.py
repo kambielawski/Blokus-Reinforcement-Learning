@@ -422,29 +422,40 @@ class GameState:
         return scores
 
     def get_rewards(self) -> Dict[int, float]:
-        """Reward per *agent* in [-1, 1].
+        """Reward per *agent* in {-1, 0, +1}.
 
-        Standard mode (4 agents): normalized score relative to best/worst.
-        Dual mode (2 agents): difference of combined scores, normalized.
+        Standard mode (4 agents): +1 for highest score, -1 for lowest,
+            0 for ties. When all scores are equal, all get 0.
+        Dual mode (2 agents): +1 for winner, -1 for loser, 0 for tie.
+            Winner is the agent whose combined score is higher.
         """
         scores = self.get_scores()
 
         if self.game_mode == 'standard':
             vals = list(scores.values())
-            max_s, min_s = max(vals), min(vals)
-            span = max_s - min_s
-            if span == 0:
+            max_s = max(vals)
+            min_s = min(vals)
+            if max_s == min_s:
                 return {i: 0.0 for i in range(4)}
-            return {i: (scores[i] - min_s) / span * 2 - 1 for i in range(4)}
+            rewards = {}
+            for i in range(4):
+                if scores[i] == max_s:
+                    rewards[i] = 1.0
+                elif scores[i] == min_s:
+                    rewards[i] = -1.0
+                else:
+                    rewards[i] = 0.0
+            return rewards
         else:
             # Agent 0: colors 0+2, Agent 1: colors 1+3
             s0 = scores[0] + scores[2]
             s1 = scores[1] + scores[3]
-            total = s0 + s1
-            if total == 0:
+            if s0 > s1:
+                return {0: 1.0, 1: -1.0}
+            elif s1 > s0:
+                return {0: -1.0, 1: 1.0}
+            else:
                 return {0: 0.0, 1: 0.0}
-            diff = (s0 - s1) / total
-            return {0: diff, 1: -diff}
 
     # ---- Legal action generation ----
 
