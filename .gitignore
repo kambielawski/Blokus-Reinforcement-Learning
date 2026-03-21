@@ -11,3 +11,6 @@ output/
 
 # Training checkpoints and model weights
 data/checkpoints/
+blokus/engine/_legal_moves.c
+*.so
+build/
