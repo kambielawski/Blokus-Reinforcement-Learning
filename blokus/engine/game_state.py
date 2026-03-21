@@ -18,6 +18,13 @@ from typing import List, Tuple, Dict, Optional, Set
 # Import Piece class (used for loading/unpickling piece definitions)
 from blokus.engine.piece import Piece
 
+# Try to import Cython-accelerated legal move generation
+try:
+    from blokus.engine._legal_moves import fast_legal_actions as _cython_legal_actions
+    _USE_CYTHON = True
+except ImportError:
+    _USE_CYTHON = False
+
 # Repo root for resolving data paths
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -463,8 +470,14 @@ class GameState:
         """All legal action indices for the current color.
 
         Returns an empty list when the current color has no moves (must pass).
-        Uses vectorized numpy validation for speed (~5-8x faster than loops).
+        Uses Cython extension if available, else numpy-based fallback.
         """
+        if _USE_CYTHON:
+            data = _get_fast_legal_data(self.pieces)
+            return _cython_legal_actions(
+                self.board, self.pieces_remaining, self.current_color,
+                self._has_played, self.pieces, data, COLOR_CORNERS,
+            )
         return _fast_legal_actions(
             self.board, self.pieces_remaining, self.current_color,
             self._has_played, self.pieces,
