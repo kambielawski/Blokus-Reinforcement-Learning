@@ -312,11 +312,11 @@ def _self_play_worker(rank: int, model_state_dict: dict, config: dict,
                       result_queue: mp.Queue) -> None:
     """Worker process that plays one self-play game.
 
-    Workers always use CPU for inference to avoid GPU memory contention with
-    the training loop.  The model is small (~1.6M params) so CPU inference
-    is fast enough, and this eliminates CUDA context overhead per worker.
+    Workers use the configured device (typically GPU).  The CUDA OOM fix is
+    in train_on_examples (mini-batch GPU loading), so GPU memory is free
+    during self-play.
     """
-    device = torch.device('cpu')
+    device = torch.device(config['device'])
     network = BlokusNetwork(
         num_blocks=config['num_blocks'],
         channels=config['channels'],
