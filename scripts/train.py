@@ -155,7 +155,7 @@ class CheckpointManager:
         # Save replay buffer separately (one file, overwritten each iteration)
         if replay_state is not None:
             buf_path = os.path.join(self.save_dir, 'replay_buffer.pt')
-            torch.save(replay_state, buf_path)
+            torch.save(replay_state, buf_path, pickle_protocol=4)
 
         return iter_path
 
