@@ -35,8 +35,10 @@ from typing import List, Dict, Any, Optional
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
-from blokus.nn.network import BlokusNetwork
+from blokus.nn.network import BlokusNetwork, make_pieces_remaining_vector
 from blokus.agents.alpha_zero import self_play_game, TrainingExample
+from blokus.engine.game_state import GameState, ACTION_SPACE_SIZE
+from blokus.mcts.mcts import MCTS
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +503,118 @@ def train_on_examples(network: BlokusNetwork,
 
 
 # ---------------------------------------------------------------------------
+# Periodic Evaluation vs Random
+# ---------------------------------------------------------------------------
+
+def _eval_select_action_raw(network, state, device):
+    """Select action using raw network policy (greedy, no MCTS)."""
+    legal = state.get_legal_actions()
+    if not legal:
+        return -1
+    board = torch.from_numpy(state.get_nn_state()).unsqueeze(0).to(device)
+    pieces = torch.from_numpy(make_pieces_remaining_vector(state)).unsqueeze(0).to(device)
+    mask = torch.from_numpy(state.get_legal_actions_mask()).unsqueeze(0).to(device)
+    with torch.no_grad():
+        log_policy, _ = network(board, pieces, mask)
+    probs = torch.exp(log_policy).squeeze(0).cpu().numpy()
+    best_a, best_p = legal[0], -1.0
+    for a in legal:
+        if probs[a] > best_p:
+            best_p = probs[a]
+            best_a = a
+    return best_a
+
+
+def _eval_play_game(network, device, mode, mcts_sims, game_mode):
+    """Play one eval game: trained agent (agent 0) vs random (agent 1).
+
+    Returns (winner, score_diff) where winner is 0/1/-1 and
+    score_diff = trained_score - random_score.
+    """
+    state = GameState.new_game(game_mode)
+    mcts = None
+    if mode == 'mcts':
+        mcts = MCTS(
+            network=network,
+            c_puct=1.5,
+            num_simulations=mcts_sims,
+            dirichlet_alpha=0.0,
+            dirichlet_epsilon=0.0,
+            temperature=0.1,
+            device=device,
+        )
+
+    while not state.is_terminal():
+        agent_idx = state.get_current_agent()
+        legal = state.get_legal_actions()
+        if not legal:
+            state = state.pass_turn()
+            continue
+
+        if agent_idx == 0:
+            if mode == 'mcts':
+                action, _, _ = mcts.select_action(state)
+            else:
+                action = _eval_select_action_raw(network, state, device)
+        else:
+            action = legal[np.random.randint(len(legal))]
+
+        state = state.apply_action(action)
+
+    rewards = state.get_rewards()
+    scores = state.get_scores()
+
+    if game_mode == 'dual':
+        trained_score = scores[0] + scores[2]
+        random_score = scores[1] + scores[3]
+    else:
+        trained_score = scores.get(0, 0)
+        random_score = sum(scores.get(i, 0) for i in range(1, 4))
+
+    if rewards[0] > rewards[1]:
+        winner = 0
+    elif rewards[1] > rewards[0]:
+        winner = 1
+    else:
+        winner = -1
+
+    return winner, trained_score - random_score
+
+
+def evaluate_vs_random(network, device, num_games, mcts_sims, game_mode):
+    """Run eval games for both raw policy and MCTS, return metrics dict."""
+    network.eval()
+    results = {}
+
+    for mode in ('raw', 'mcts'):
+        sims = mcts_sims if mode == 'mcts' else 0
+        wins = 0
+        total_score_diff = 0.0
+
+        t0 = time.time()
+        for _ in range(num_games):
+            winner, score_diff = _eval_play_game(
+                network, device, mode, sims, game_mode
+            )
+            if winner == 0:
+                wins += 1
+            total_score_diff += score_diff
+        elapsed = time.time() - t0
+
+        win_rate = wins / num_games
+        avg_score_diff = total_score_diff / num_games
+        results[f'eval/{mode}_win_rate'] = win_rate
+        results[f'eval/{mode}_avg_score_diff'] = avg_score_diff
+
+        print(f"  Eval ({mode:4s}): win_rate={win_rate:.1%}, "
+              f"avg_score_diff={avg_score_diff:+.1f} "
+              f"({num_games} games in {elapsed:.1f}s)")
+
+    network.train()
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -768,10 +882,26 @@ def main():
         ckpt_mgr.update_best(iteration, network, optimizer, meta, cfg,
                              stats['policy_loss'])
 
+        # ------ Periodic Eval vs Random ------
+        eval_metrics = {}
+        eval_cfg = cfg.get('eval', {})
+        eval_interval = eval_cfg.get('interval', 0)
+        if eval_interval > 0 and iteration % eval_interval == 0:
+            eval_metrics = evaluate_vs_random(
+                network=network,
+                device=device,
+                num_games=eval_cfg.get('games', 50),
+                mcts_sims=eval_cfg.get('mcts_sims', 25),
+                game_mode=cfg['self_play']['game_mode'],
+            )
+            # Free GPU cache after eval games
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+
         # ------ W&B ------
         if cfg['wandb']['enabled'] and wandb_run:
             import wandb
-            wandb.log({
+            log_data = {
                 'iteration': iteration,
                 'policy_loss': stats['policy_loss'],
                 'value_loss': stats['value_loss'],
@@ -794,7 +924,9 @@ def main():
                 'iter_value_target_mean': iter_vt_mean,
                 'iter_value_target_std': iter_vt_std,
                 'value_accuracy': stats['value_accuracy'],
-            }, step=iteration)
+            }
+            log_data.update(eval_metrics)
+            wandb.log(log_data, step=iteration)
 
     print(f"\nTraining complete: {cumulative_games} games, "
           f"{cumulative_examples} examples over {total_iterations} iterations")

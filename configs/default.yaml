@@ -29,6 +29,11 @@ self_play:
   max_moves: 0                  # 0 = play to completion
   game_mode: dual               # 'dual' (1v1) or 'standard' (4-player)
 
+eval:
+  interval: 10                    # Evaluate every N iterations (0 = disabled)
+  games: 50                       # Games per eval (raw and MCTS each)
+  mcts_sims: 25                   # MCTS simulations for eval games
+
 checkpoint:
   dir: data/checkpoints
   save_every_n_iters: 1         # Save after every N iterations
