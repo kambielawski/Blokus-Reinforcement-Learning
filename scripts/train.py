@@ -123,9 +123,16 @@ class CheckpointManager:
     def save(self, iteration: int, network: nn.Module,
              optimizer: optim.Optimizer, meta: Dict[str, Any],
              cfg: Dict[str, Any]) -> Optional[str]:
-        """Save checkpoint if due. Always saves 'latest'. Returns path or None."""
+        """Save checkpoint if due. Always saves 'latest'. Returns path or None.
+
+        The replay buffer is saved to a separate file (replay_buffer.pt) to
+        keep per-iteration checkpoints small (~10 MB vs ~10 GB).
+        """
         if iteration % self.save_every != 0:
             return None
+
+        # Separate replay buffer from the main checkpoint payload
+        replay_state = meta.pop('replay_buffer', None)
 
         payload = {
             'iteration': iteration,
@@ -142,6 +149,11 @@ class CheckpointManager:
         # Save numbered checkpoint
         iter_path = os.path.join(self.save_dir, f'checkpoint_{iteration:04d}.pt')
         torch.save(payload, iter_path)
+
+        # Save replay buffer separately (one file, overwritten each iteration)
+        if replay_state is not None:
+            buf_path = os.path.join(self.save_dir, 'replay_buffer.pt')
+            torch.save(replay_state, buf_path)
 
         return iter_path
 
@@ -177,12 +189,14 @@ class CheckpointManager:
         # Save/update the best checkpoint file
         if entries and entries[0]['iteration'] == iteration:
             best_ckpt_path = os.path.join(self.save_dir, 'checkpoint_best.pt')
+            # Exclude replay buffer from best checkpoint (saved separately)
+            meta_clean = {k: v for k, v in meta.items() if k != 'replay_buffer'}
             payload = {
                 'iteration': iteration,
                 'model_state_dict': network.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'config': cfg,
-                **meta,
+                **meta_clean,
             }
             torch.save(payload, best_ckpt_path)
 
@@ -240,17 +254,36 @@ class ReplayBuffer:
         return len(self.buffer)
 
     def state_dict(self) -> dict:
-        """Serialize buffer contents for checkpointing."""
+        """Serialize buffer contents for checkpointing.
+
+        Pre-allocates output arrays and fills them in-place to avoid the
+        2x peak memory that np.stack (list-of-arrays → temporary list →
+        contiguous array) would cause.
+        """
         if not self.buffer:
             return {'examples': [], 'max_size': self.max_size}
+        n = len(self.buffer)
+        ex0 = self.buffer[0]
+        board_states = np.empty((n, *ex0.board_state.shape), dtype=np.float32)
+        pieces_remaining = np.empty((n, *ex0.pieces_remaining.shape),
+                                    dtype=np.float32)
+        legal_masks = np.empty((n, *ex0.legal_mask.shape), dtype=np.float32)
+        policy_targets = np.empty((n, *ex0.policy_target.shape),
+                                  dtype=np.float32)
+        value_targets = np.empty(n, dtype=np.float32)
+        for i, ex in enumerate(self.buffer):
+            board_states[i] = ex.board_state
+            pieces_remaining[i] = ex.pieces_remaining
+            legal_masks[i] = ex.legal_mask
+            policy_targets[i] = ex.policy_target
+            value_targets[i] = ex.value_target
         return {
             'max_size': self.max_size,
-            'board_states': np.stack([ex.board_state for ex in self.buffer]),
-            'pieces_remaining': np.stack([ex.pieces_remaining for ex in self.buffer]),
-            'legal_masks': np.stack([ex.legal_mask for ex in self.buffer]),
-            'policy_targets': np.stack([ex.policy_target for ex in self.buffer]),
-            'value_targets': np.array([ex.value_target for ex in self.buffer],
-                                      dtype=np.float32),
+            'board_states': board_states,
+            'pieces_remaining': pieces_remaining,
+            'legal_masks': legal_masks,
+            'policy_targets': policy_targets,
+            'value_targets': value_targets,
         }
 
     def load_state_dict(self, state: dict) -> None:
@@ -277,8 +310,13 @@ class ReplayBuffer:
 
 def _self_play_worker(rank: int, model_state_dict: dict, config: dict,
                       result_queue: mp.Queue) -> None:
-    """Worker process that plays one self-play game."""
-    device = torch.device(config['device'])
+    """Worker process that plays one self-play game.
+
+    Workers always use CPU for inference to avoid GPU memory contention with
+    the training loop.  The model is small (~1.6M params) so CPU inference
+    is fast enough, and this eliminates CUDA context overhead per worker.
+    """
+    device = torch.device('cpu')
     network = BlokusNetwork(
         num_blocks=config['num_blocks'],
         channels=config['channels'],
@@ -375,24 +413,29 @@ def train_on_examples(network: BlokusNetwork,
     """Train the network on self-play examples.
 
     Loss = policy_loss + value_loss_weight * MSE(value_pred, value_target)
+
+    Data stays on CPU; only each mini-batch is moved to the device to avoid
+    loading the entire replay buffer onto GPU (which can exceed VRAM as the
+    buffer grows).
     """
     network.train()
 
+    # Stack into CPU tensors — never move the full dataset to GPU
     board_states = torch.from_numpy(
         np.stack([ex.board_state for ex in examples])
-    ).to(device)
+    )
     pieces_vecs = torch.from_numpy(
         np.stack([ex.pieces_remaining for ex in examples])
-    ).to(device)
+    )
     legal_masks = torch.from_numpy(
         np.stack([ex.legal_mask for ex in examples])
-    ).to(device)
+    )
     policy_targets = torch.from_numpy(
         np.stack([ex.policy_target for ex in examples])
-    ).to(device)
+    )
     value_targets = torch.from_numpy(
         np.array([ex.value_target for ex in examples], dtype=np.float32)
-    ).to(device)
+    )
 
     n = len(examples)
     total_policy_loss = 0.0
@@ -401,19 +444,17 @@ def train_on_examples(network: BlokusNetwork,
 
     for epoch in range(epochs):
         perm = torch.randperm(n)
-        board_states = board_states[perm]
-        pieces_vecs = pieces_vecs[perm]
-        legal_masks = legal_masks[perm]
-        policy_targets = policy_targets[perm]
-        value_targets = value_targets[perm]
 
         for i in range(0, n, batch_size):
             end = min(i + batch_size, n)
-            bs = board_states[i:end]
-            pv = pieces_vecs[i:end]
-            lm = legal_masks[i:end]
-            pt = policy_targets[i:end]
-            vt = value_targets[i:end]
+            idx = perm[i:end]
+
+            # Move only this mini-batch to device
+            bs = board_states[idx].to(device, non_blocking=True)
+            pv = pieces_vecs[idx].to(device, non_blocking=True)
+            lm = legal_masks[idx].to(device, non_blocking=True)
+            pt = policy_targets[idx].to(device, non_blocking=True)
+            vt = value_targets[idx].to(device, non_blocking=True)
 
             optimizer.zero_grad()
             log_policy, value_pred = network(bs, pv, lm)
@@ -427,10 +468,33 @@ def train_on_examples(network: BlokusNetwork,
             total_value_loss += value_loss.item()
             total_batches += 1
 
+    # Compute value accuracy: % of non-draw examples where sign(pred) == sign(target)
+    network.eval()
+    correct = 0
+    non_draw = 0
+    with torch.no_grad():
+        for i in range(0, n, batch_size):
+            end = min(i + batch_size, n)
+            bs = board_states[i:end].to(device, non_blocking=True)
+            pv = pieces_vecs[i:end].to(device, non_blocking=True)
+            lm = legal_masks[i:end].to(device, non_blocking=True)
+            vt = value_targets[i:end]
+
+            _, value_pred = network(bs, pv, lm)
+            vp = value_pred.cpu()
+
+            # Only count examples with non-zero target (skip draws)
+            mask = vt != 0
+            non_draw += mask.sum().item()
+            correct += ((vp[mask] > 0) == (vt[mask] > 0)).sum().item()
+
+    value_accuracy = correct / max(non_draw, 1)
+
     return {
         'policy_loss': total_policy_loss / max(total_batches, 1),
         'value_loss': total_value_loss / max(total_batches, 1),
         'total_loss': (total_policy_loss + total_value_loss) / max(total_batches, 1),
+        'value_accuracy': value_accuracy,
         'num_examples': n,
         'num_batches': total_batches,
     }
@@ -533,16 +597,27 @@ def main():
             cumulative_games = ckpt.get('cumulative_games', 0)
             cumulative_examples = ckpt.get('cumulative_examples', 0)
             loss_history = ckpt.get('loss_history', [])
-            # Restore replay buffer
-            if 'replay_buffer' in ckpt:
-                replay_buffer.load_state_dict(ckpt['replay_buffer'])
+            # Restore replay buffer — check separate file first, then inline
+            buf_path = os.path.join(cfg['checkpoint']['dir'], 'replay_buffer.pt')
+            if os.path.exists(buf_path):
+                buf_state = torch.load(buf_path, map_location='cpu',
+                                       weights_only=False)
+                replay_buffer.load_state_dict(buf_state)
+                del buf_state
                 print(f"Resumed from iteration {start_iteration - 1}: "
                       f"{cumulative_games} games, {cumulative_examples} examples, "
                       f"{len(replay_buffer)} examples in buffer")
+            elif 'replay_buffer' in ckpt:
+                # Backwards compat: buffer was embedded in old checkpoints
+                replay_buffer.load_state_dict(ckpt['replay_buffer'])
+                print(f"Resumed from iteration {start_iteration - 1}: "
+                      f"{cumulative_games} games, {cumulative_examples} examples, "
+                      f"{len(replay_buffer)} examples in buffer (from inline ckpt)")
             else:
                 print(f"Resumed from iteration {start_iteration - 1}: "
                       f"{cumulative_games} games, {cumulative_examples} examples "
-                      f"(no replay buffer in checkpoint)")
+                      f"(no replay buffer found)")
+            del ckpt  # Free checkpoint memory
         else:
             print("No checkpoint found — starting from scratch")
 
@@ -659,6 +734,10 @@ def main():
             device=device,
         )
         train_time = time.time() - t_tr
+
+        # Free cached GPU memory before self-play workers spawn
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
         total_iter_time = sp_time + train_time
 
         loss_entry = {
@@ -671,7 +750,8 @@ def main():
 
         print(f"  Training: policy_loss={stats['policy_loss']:.4f}, "
               f"value_loss={stats['value_loss']:.4f}, "
-              f"total_loss={stats['total_loss']:.4f} "
+              f"total_loss={stats['total_loss']:.4f}, "
+              f"value_acc={stats['value_accuracy']:.1%} "
               f"({train_time:.1f}s)")
 
         # ------ Checkpoint ------
@@ -713,6 +793,7 @@ def main():
                 'value_target_max': vt_max,
                 'iter_value_target_mean': iter_vt_mean,
                 'iter_value_target_std': iter_vt_std,
+                'value_accuracy': stats['value_accuracy'],
             }, step=iteration)
 
     print(f"\nTraining complete: {cumulative_games} games, "

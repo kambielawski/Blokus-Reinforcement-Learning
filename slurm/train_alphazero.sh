@@ -3,8 +3,8 @@
 #SBATCH --partition=gpu-preempt
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --time=06:00:00
+#SBATCH --mem=64G
+#SBATCH --time=18:00:00
 #SBATCH --output=blokus-az-%j.out
 
 # ---- Blokus AlphaZero Training on VACC ----
