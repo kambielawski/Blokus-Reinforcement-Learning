@@ -12,7 +12,7 @@ training:
   batch_size: 64
   epochs_per_iter: 5
   iterations: 100
-  replay_buffer_size: 50000
+  replay_buffer_size: 25000       # ~13.3 GB RAM; 50K was OOM on 64GB nodes
   value_loss_weight: 10.0
 
 self_play:

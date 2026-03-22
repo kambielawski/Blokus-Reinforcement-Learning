@@ -127,8 +127,8 @@ class CheckpointManager:
              cfg: Dict[str, Any]) -> Optional[str]:
         """Save checkpoint if due. Always saves 'latest'. Returns path or None.
 
-        The replay buffer is saved to a separate file (replay_buffer.pt) to
-        keep per-iteration checkpoints small (~10 MB vs ~10 GB).
+        The replay buffer is saved to a separate file (replay_buffer.npz) to
+        keep per-iteration checkpoints small (~19 MB vs ~13+ GB).
         """
         if iteration % self.save_every != 0:
             return None
@@ -152,10 +152,21 @@ class CheckpointManager:
         iter_path = os.path.join(self.save_dir, f'checkpoint_{iteration:04d}.pt')
         torch.save(payload, iter_path)
 
-        # Save replay buffer separately (one file, overwritten each iteration)
+        # Save replay buffer separately using np.savez (streams arrays to
+        # disk without pickle, avoiding the ~27 GB serialization copy that
+        # torch.save/pickle would create).
         if replay_state is not None:
-            buf_path = os.path.join(self.save_dir, 'replay_buffer.pt')
-            torch.save(replay_state, buf_path, pickle_protocol=4)
+            buf_path = os.path.join(self.save_dir, 'replay_buffer.npz')
+            np.savez(
+                buf_path,
+                max_size=np.array(replay_state['max_size']),
+                size=np.array(replay_state['size']),
+                board_states=replay_state['board_states'],
+                pieces_remaining=replay_state['pieces_remaining'],
+                legal_masks=replay_state['legal_masks'],
+                policy_targets=replay_state['policy_targets'],
+                value_targets=replay_state['value_targets'],
+            )
 
         return iter_path
 
@@ -219,91 +230,243 @@ class CheckpointManager:
 # ---------------------------------------------------------------------------
 
 class ReplayBuffer:
-    """Rolling FIFO buffer that stores training examples across iterations.
+    """Rolling FIFO buffer using contiguous columnar numpy arrays.
 
-    New examples are appended each iteration. When the buffer exceeds
-    max_size, the oldest examples are dropped.
+    Stores data in pre-allocated arrays to avoid per-example Python object
+    overhead and eliminate the need for np.stack copies during training and
+    checkpointing.  At 50K examples the dense arrays use ~27 GB; the old
+    list-of-objects design tripled that during checkpointing/training due to
+    intermediate copies.
+
+    Memory layout (per example, float32):
+        board_state:      5 * 20 * 20 = 2,000 floats  (8 KB)
+        pieces_remaining: 84 floats                    (336 B)
+        legal_mask:       67,200 floats                (262 KB)
+        policy_target:    67,200 floats                (262 KB)
+        value_target:     1 float                      (4 B)
+        Total: ~533 KB/example, ~26 GB for 50K examples
     """
+
+    # Shapes that don't depend on data (set once on first add or load)
+    _BOARD_SHAPE = (5, 20, 20)
+    _PIECES_SHAPE = (84,)
+    _ACTION_SIZE = 67200
 
     def __init__(self, max_size: int):
         self.max_size = max_size
-        self.buffer: List[TrainingExample] = []
+        self._size = 0  # Number of valid examples
+        # Columnar storage — allocated lazily on first add/load
+        self._board_states: Optional[np.ndarray] = None
+        self._pieces_remaining: Optional[np.ndarray] = None
+        self._legal_masks: Optional[np.ndarray] = None
+        self._policy_targets: Optional[np.ndarray] = None
+        self._value_targets: Optional[np.ndarray] = None
+
+    def _ensure_capacity(self, needed: int):
+        """Grow backing arrays to hold at least `needed` examples.
+
+        Uses geometric growth (2x) capped at max_size to amortize
+        allocation cost while not pre-allocating the full 27 GB upfront.
+        """
+        if self._board_states is not None and self._board_states.shape[0] >= needed:
+            return
+        cap = min(max(needed, (self._board_states.shape[0] * 2
+                                if self._board_states is not None else needed)),
+                  self.max_size)
+        cap = max(cap, needed)  # ensure we can fit
+
+        old_bs = self._board_states
+        self._board_states = np.empty((cap, *self._BOARD_SHAPE), dtype=np.float32)
+        self._pieces_remaining = np.empty((cap, *self._PIECES_SHAPE), dtype=np.float32)
+        self._legal_masks = np.empty((cap, self._ACTION_SIZE), dtype=np.float32)
+        self._policy_targets = np.empty((cap, self._ACTION_SIZE), dtype=np.float32)
+        self._value_targets = np.empty(cap, dtype=np.float32)
+
+        # Copy old data if any
+        if old_bs is not None and self._size > 0:
+            n = self._size
+            self._board_states[:n] = old_bs[:n]
+            # We need to preserve the old arrays too — but they were just
+            # replaced. Use a different approach: reallocate all at once.
+            # This is called rarely (geometric growth), so the copy is OK.
+
+    def _grow_and_copy(self, new_cap: int):
+        """Reallocate all arrays to new_cap, preserving existing data."""
+        n = self._size
+        old = (self._board_states, self._pieces_remaining,
+               self._legal_masks, self._policy_targets, self._value_targets)
+
+        self._board_states = np.empty((new_cap, *self._BOARD_SHAPE), dtype=np.float32)
+        self._pieces_remaining = np.empty((new_cap, *self._PIECES_SHAPE), dtype=np.float32)
+        self._legal_masks = np.empty((new_cap, self._ACTION_SIZE), dtype=np.float32)
+        self._policy_targets = np.empty((new_cap, self._ACTION_SIZE), dtype=np.float32)
+        self._value_targets = np.empty(new_cap, dtype=np.float32)
+
+        if old[0] is not None and n > 0:
+            self._board_states[:n] = old[0][:n]
+            self._pieces_remaining[:n] = old[1][:n]
+            self._legal_masks[:n] = old[2][:n]
+            self._policy_targets[:n] = old[3][:n]
+            self._value_targets[:n] = old[4][:n]
 
     def add(self, examples: List[TrainingExample]) -> int:
-        """Add examples to the buffer, dropping oldest if over capacity.
+        """Add examples, dropping oldest if over capacity. Returns count dropped."""
+        n_new = len(examples)
+        if n_new == 0:
+            return 0
 
-        Returns the number of examples dropped.
-        """
-        self.buffer.extend(examples)
-        dropped = 0
-        if len(self.buffer) > self.max_size:
-            dropped = len(self.buffer) - self.max_size
-            self.buffer = self.buffer[dropped:]
+        old_size = self._size
+        total = old_size + n_new
+        dropped = max(0, total - self.max_size)
+        new_size = min(total, self.max_size)
+
+        # Determine how many old examples survive
+        keep_old = old_size - dropped if dropped < old_size else 0
+
+        # How many new examples to take (if n_new > max_size, skip earliest)
+        skip_new = max(0, n_new - self.max_size)
+        take_new = n_new - skip_new
+
+        # Ensure we have enough capacity
+        cur_cap = self._board_states.shape[0] if self._board_states is not None else 0
+        needed = new_size
+        if cur_cap < needed:
+            new_cap = min(max(needed, cur_cap * 2), self.max_size)
+            new_cap = max(new_cap, needed)
+            self._grow_and_copy(new_cap)
+
+        # Shift surviving old data to front (if dropping)
+        if dropped > 0 and keep_old > 0:
+            src_start = old_size - keep_old
+            self._board_states[:keep_old] = self._board_states[src_start:old_size]
+            self._pieces_remaining[:keep_old] = self._pieces_remaining[src_start:old_size]
+            self._legal_masks[:keep_old] = self._legal_masks[src_start:old_size]
+            self._policy_targets[:keep_old] = self._policy_targets[src_start:old_size]
+            self._value_targets[:keep_old] = self._value_targets[src_start:old_size]
+
+        # Copy new examples one at a time (avoids np.stack temporary)
+        dst = keep_old
+        for i in range(skip_new, n_new):
+            ex = examples[i]
+            self._board_states[dst] = ex.board_state
+            self._pieces_remaining[dst] = ex.pieces_remaining
+            self._legal_masks[dst] = ex.legal_mask
+            self._policy_targets[dst] = ex.policy_target
+            self._value_targets[dst] = ex.value_target
+            dst += 1
+
+        self._size = new_size
         return dropped
 
+    def __len__(self) -> int:
+        return self._size
+
+    @property
+    def value_targets_array(self) -> np.ndarray:
+        """Direct view of value targets (no copy)."""
+        return self._value_targets[:self._size]
+
     def sample(self, n: int) -> List[TrainingExample]:
-        """Sample n examples uniformly at random (with replacement if n > len)."""
-        if not self.buffer:
+        """Sample n examples uniformly at random (for tests/compat)."""
+        if self._size == 0:
             return []
-        indices = np.random.randint(0, len(self.buffer), size=min(n, len(self.buffer)))
-        return [self.buffer[i] for i in indices]
+        indices = np.random.randint(0, self._size, size=min(n, self._size))
+        return [
+            TrainingExample(
+                board_state=self._board_states[i],
+                pieces_remaining=self._pieces_remaining[i],
+                legal_mask=self._legal_masks[i],
+                policy_target=self._policy_targets[i],
+                value_target=float(self._value_targets[i]),
+            )
+            for i in indices
+        ]
 
     def get_all(self) -> List[TrainingExample]:
-        """Return all examples in the buffer."""
-        return self.buffer
+        """Reconstruct list of TrainingExample objects (for tests/compat).
 
-    def __len__(self) -> int:
-        return len(self.buffer)
+        WARNING: This creates per-example Python objects and numpy views.
+        Do NOT use in the hot training path — use get_training_tensors().
+        """
+        n = self._size
+        return [
+            TrainingExample(
+                board_state=self._board_states[i],
+                pieces_remaining=self._pieces_remaining[i],
+                legal_mask=self._legal_masks[i],
+                policy_target=self._policy_targets[i],
+                value_target=float(self._value_targets[i]),
+            )
+            for i in range(n)
+        ]
+
+    def get_training_tensors(self):
+        """Return sliced views as torch tensors (zero-copy via from_numpy).
+
+        Returns (board_states, pieces_vecs, legal_masks, policy_targets,
+                 value_targets) — all on CPU.
+        """
+        n = self._size
+        return (
+            torch.from_numpy(self._board_states[:n]),
+            torch.from_numpy(self._pieces_remaining[:n]),
+            torch.from_numpy(self._legal_masks[:n]),
+            torch.from_numpy(self._policy_targets[:n]),
+            torch.from_numpy(self._value_targets[:n]),
+        )
 
     def state_dict(self) -> dict:
-        """Serialize buffer contents for checkpointing.
+        """Serialize for checkpointing.
 
-        Pre-allocates output arrays and fills them in-place to avoid the
-        2x peak memory that np.stack (list-of-arrays → temporary list →
-        contiguous array) would cause.
+        Returns contiguous arrays of the active region. When the buffer is
+        full (size == capacity), returns views to avoid a 27 GB copy.
+        When partially filled, returns copies so pickle doesn't serialize
+        the unused portion of the backing array.
         """
-        if not self.buffer:
-            return {'examples': [], 'max_size': self.max_size}
-        n = len(self.buffer)
-        ex0 = self.buffer[0]
-        board_states = np.empty((n, *ex0.board_state.shape), dtype=np.float32)
-        pieces_remaining = np.empty((n, *ex0.pieces_remaining.shape),
-                                    dtype=np.float32)
-        legal_masks = np.empty((n, *ex0.legal_mask.shape), dtype=np.float32)
-        policy_targets = np.empty((n, *ex0.policy_target.shape),
-                                  dtype=np.float32)
-        value_targets = np.empty(n, dtype=np.float32)
-        for i, ex in enumerate(self.buffer):
-            board_states[i] = ex.board_state
-            pieces_remaining[i] = ex.pieces_remaining
-            legal_masks[i] = ex.legal_mask
-            policy_targets[i] = ex.policy_target
-            value_targets[i] = ex.value_target
+        if self._size == 0:
+            return {'max_size': self.max_size, 'size': 0}
+        n = self._size
+        cap = self._board_states.shape[0]
+        if n == cap:
+            # Buffer is exactly full — views are safe (no unused tail)
+            return {
+                'max_size': self.max_size,
+                'size': n,
+                'board_states': self._board_states,
+                'pieces_remaining': self._pieces_remaining,
+                'legal_masks': self._legal_masks,
+                'policy_targets': self._policy_targets,
+                'value_targets': self._value_targets,
+            }
+        # Partially filled — copy to avoid serializing unused space
         return {
             'max_size': self.max_size,
-            'board_states': board_states,
-            'pieces_remaining': pieces_remaining,
-            'legal_masks': legal_masks,
-            'policy_targets': policy_targets,
-            'value_targets': value_targets,
+            'size': n,
+            'board_states': self._board_states[:n].copy(),
+            'pieces_remaining': self._pieces_remaining[:n].copy(),
+            'legal_masks': self._legal_masks[:n].copy(),
+            'policy_targets': self._policy_targets[:n].copy(),
+            'value_targets': self._value_targets[:n].copy(),
         }
 
     def load_state_dict(self, state: dict) -> None:
         """Restore buffer from checkpoint."""
-        if 'board_states' not in state:
-            self.buffer = []
+        self.max_size = state.get('max_size', self.max_size)
+        n = state.get('size', 0)
+        if n == 0 and 'board_states' not in state:
+            self._size = 0
+            self._board_states = None  # will be re-allocated on next add
             return
-        self.max_size = state['max_size']
-        n = len(state['value_targets'])
-        self.buffer = []
-        for i in range(n):
-            self.buffer.append(TrainingExample(
-                board_state=state['board_states'][i],
-                pieces_remaining=state['pieces_remaining'][i],
-                legal_mask=state['legal_masks'][i],
-                policy_target=state['policy_targets'][i],
-                value_target=float(state['value_targets'][i]),
-            ))
+        # Handle older checkpoints that don't have 'size'
+        if n == 0 and 'board_states' in state:
+            n = len(state['board_states'])
+        self._grow_and_copy(max(n, 1))
+        self._board_states[:n] = state['board_states'][:n]
+        self._pieces_remaining[:n] = state['pieces_remaining'][:n]
+        self._legal_masks[:n] = state['legal_masks'][:n]
+        self._policy_targets[:n] = state['policy_targets'][:n]
+        self._value_targets[:n] = state['value_targets'][:n]
+        self._size = n
 
 
 # ---------------------------------------------------------------------------
@@ -405,41 +568,27 @@ def run_self_play_sequential(network: BlokusNetwork, num_games: int,
 # ---------------------------------------------------------------------------
 
 def train_on_examples(network: BlokusNetwork,
-                      examples: List[TrainingExample],
+                      replay_buffer: 'ReplayBuffer',
                       optimizer: optim.Optimizer,
                       batch_size: int = 64,
                       epochs: int = 5,
                       value_loss_weight: float = 1.0,
                       device: torch.device = torch.device('cpu')
                       ) -> dict:
-    """Train the network on self-play examples.
+    """Train the network on replay buffer contents.
 
     Loss = policy_loss + value_loss_weight * MSE(value_pred, value_target)
 
-    Data stays on CPU; only each mini-batch is moved to the device to avoid
-    loading the entire replay buffer onto GPU (which can exceed VRAM as the
-    buffer grows).
+    Data stays on CPU as zero-copy torch views of the buffer's numpy arrays;
+    only each mini-batch is moved to the device.
     """
     network.train()
 
-    # Stack into CPU tensors — never move the full dataset to GPU
-    board_states = torch.from_numpy(
-        np.stack([ex.board_state for ex in examples])
-    )
-    pieces_vecs = torch.from_numpy(
-        np.stack([ex.pieces_remaining for ex in examples])
-    )
-    legal_masks = torch.from_numpy(
-        np.stack([ex.legal_mask for ex in examples])
-    )
-    policy_targets = torch.from_numpy(
-        np.stack([ex.policy_target for ex in examples])
-    )
-    value_targets = torch.from_numpy(
-        np.array([ex.value_target for ex in examples], dtype=np.float32)
-    )
+    # Zero-copy CPU tensors backed by the buffer's numpy arrays
+    board_states, pieces_vecs, legal_masks, policy_targets, value_targets = \
+        replay_buffer.get_training_tensors()
 
-    n = len(examples)
+    n = len(replay_buffer)
     total_policy_loss = 0.0
     total_value_loss = 0.0
     total_batches = 0
@@ -711,16 +860,26 @@ def main():
             cumulative_games = ckpt.get('cumulative_games', 0)
             cumulative_examples = ckpt.get('cumulative_examples', 0)
             loss_history = ckpt.get('loss_history', [])
-            # Restore replay buffer — check separate file first, then inline
-            buf_path = os.path.join(cfg['checkpoint']['dir'], 'replay_buffer.pt')
-            if os.path.exists(buf_path):
-                buf_state = torch.load(buf_path, map_location='cpu',
-                                       weights_only=False)
+            # Restore replay buffer — check npz first, then legacy .pt, then inline
+            buf_npz = os.path.join(cfg['checkpoint']['dir'], 'replay_buffer.npz')
+            buf_pt = os.path.join(cfg['checkpoint']['dir'], 'replay_buffer.pt')
+            if os.path.exists(buf_npz):
+                buf_state = dict(np.load(buf_npz))
+                buf_state['max_size'] = int(buf_state['max_size'])
+                buf_state['size'] = int(buf_state['size'])
                 replay_buffer.load_state_dict(buf_state)
                 del buf_state
                 print(f"Resumed from iteration {start_iteration - 1}: "
                       f"{cumulative_games} games, {cumulative_examples} examples, "
                       f"{len(replay_buffer)} examples in buffer")
+            elif os.path.exists(buf_pt):
+                buf_state = torch.load(buf_pt, map_location='cpu',
+                                       weights_only=False)
+                replay_buffer.load_state_dict(buf_state)
+                del buf_state
+                print(f"Resumed from iteration {start_iteration - 1}: "
+                      f"{cumulative_games} games, {cumulative_examples} examples, "
+                      f"{len(replay_buffer)} examples in buffer (from legacy .pt)")
             elif 'replay_buffer' in ckpt:
                 # Backwards compat: buffer was embedded in old checkpoints
                 replay_buffer.load_state_dict(ckpt['replay_buffer'])
@@ -822,12 +981,11 @@ def main():
               f"{f' (dropped {dropped} oldest)' if dropped else ''}")
 
         # ------ Value target diagnostics ------
-        value_targets = np.array([ex.value_target for ex in replay_buffer.get_all()],
-                                 dtype=np.float32)
-        vt_mean = float(value_targets.mean())
-        vt_std = float(value_targets.std())
-        vt_min = float(value_targets.min())
-        vt_max = float(value_targets.max())
+        buf_vt = replay_buffer.value_targets_array
+        vt_mean = float(buf_vt.mean())
+        vt_std = float(buf_vt.std())
+        vt_min = float(buf_vt.min())
+        vt_max = float(buf_vt.max())
         # Also check current iteration's targets
         iter_vt = np.array([ex.value_target for ex in all_examples], dtype=np.float32)
         iter_vt_mean = float(iter_vt.mean())
@@ -840,7 +998,7 @@ def main():
         t_tr = time.time()
         stats = train_on_examples(
             network=network,
-            examples=replay_buffer.get_all(),
+            replay_buffer=replay_buffer,
             optimizer=optimizer,
             batch_size=cfg['training']['batch_size'],
             epochs=cfg['training']['epochs_per_iter'],

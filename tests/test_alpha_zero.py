@@ -375,8 +375,8 @@ class TestReplayBuffer:
         # Oldest examples (value=0.1) should have been partially dropped,
         # newest (value=0.9) should all be present
         values = [ex.value_target for ex in buf.get_all()]
-        assert values[-1] == 0.9  # last added is newest
-        assert values[0] == 0.1   # some old ones remain
+        assert values[-1] == pytest.approx(0.9)  # last added is newest
+        assert values[0] == pytest.approx(0.1)   # some old ones remain
 
     def test_buffer_checkpoint_roundtrip(self, train_module, make_examples):
         """Buffer state_dict/load_state_dict should preserve contents."""
@@ -432,20 +432,24 @@ class TestTraining:
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             'scripts',
         ))
-        from train import train_on_examples
+        from train import train_on_examples, ReplayBuffer
 
         optimizer = torch.optim.Adam(network.parameters(), lr=1e-3)
 
+        # Wrap examples in a ReplayBuffer
+        buf = ReplayBuffer(max_size=10000)
+        buf.add(examples)
+
         # Train for several epochs on the same data — loss should decrease
         stats1 = train_on_examples(
-            network, examples, optimizer,
+            network, buf, optimizer,
             batch_size=32, epochs=1, device=device,
         )
 
         # Continue training on the same data for more epochs
         for _ in range(5):
             stats2 = train_on_examples(
-                network, examples, optimizer,
+                network, buf, optimizer,
                 batch_size=32, epochs=5, device=device,
             )
 
