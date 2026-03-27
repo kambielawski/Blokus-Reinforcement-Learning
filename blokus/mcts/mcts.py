@@ -285,7 +285,7 @@ class MCTS:
             child = MCTSNode(pass_state, parent=node, action=-1, prior=1.0)
             node.children[-1] = child
             node.is_expanded = True
-            return self._evaluate_single(state, legal)
+            return self._evaluate_single(state, legal)[1]
 
         # Build legal actions mask from the known legal list (avoid recomputation)
         legal_mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
