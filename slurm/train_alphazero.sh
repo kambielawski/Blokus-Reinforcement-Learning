@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=18:00:00
+#SBATCH --time=48:00:00
 #SBATCH --output=blokus-az-%j.out
 
 # ---- Blokus AlphaZero Training on VACC ----
@@ -32,7 +32,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || ec
 echo "================================================"
 
 # Config file (default: configs/full.yaml)
-CONFIG="${TRAIN_CONFIG:-configs/full.yaml}"
+CONFIG="${TRAIN_CONFIG:-configs/bugfix-v1.yaml}"
 
 # Extra CLI args
 ARGS="${TRAIN_ARGS:-}"

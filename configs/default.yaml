@@ -13,6 +13,7 @@ mcts:
   temperature: 1.0
   temp_threshold_move: 15       # Switch to greedy after this many moves
   batch_size: 8                 # Leaves batched per NN call
+  top_k_actions: 50             # Only expand top K actions by prior (0 = expand all)
 
 training:
   learning_rate: 0.001
@@ -31,7 +32,7 @@ self_play:
 
 eval:
   interval: 10                    # Evaluate every N iterations (0 = disabled)
-  games: 50                       # Games per eval (raw and MCTS each)
+  games: 200                      # Games per eval (raw and MCTS each)
   mcts_sims: 25                   # MCTS simulations for eval games
 
 checkpoint:

@@ -51,7 +51,8 @@ class AlphaZeroAgent:
                  dirichlet_alpha: float = 0.3,
                  dirichlet_epsilon: float = 0.25,
                  temperature: float = 1.0,
-                 device: Optional[torch.device] = None):
+                 device: Optional[torch.device] = None,
+                 top_k_actions: int = 0):
         self.network = network
         self.device = device or torch.device('cpu')
         self.mcts = MCTS(
@@ -62,6 +63,7 @@ class AlphaZeroAgent:
             dirichlet_epsilon=dirichlet_epsilon,
             temperature=temperature,
             device=self.device,
+            top_k_actions=top_k_actions,
         )
 
     def select_action(self, state: GameState) -> Tuple[int, np.ndarray]:
@@ -89,7 +91,8 @@ def self_play_game(network: BlokusNetwork,
                    c_puct: float = 1.5,
                    temp_threshold: int = 15,
                    max_moves: int = 0,
-                   device: Optional[torch.device] = None
+                   device: Optional[torch.device] = None,
+                   top_k_actions: int = 0,
                    ) -> List[TrainingExample]:
     """Play a complete self-play game and collect training examples.
 
@@ -115,6 +118,7 @@ def self_play_game(network: BlokusNetwork,
         c_puct=c_puct,
         temperature=1.0,
         device=device,
+        top_k_actions=top_k_actions,
     )
 
     state = GameState.new_game(game_mode)

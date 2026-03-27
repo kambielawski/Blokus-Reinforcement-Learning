@@ -497,6 +497,7 @@ def _self_play_worker(rank: int, model_state_dict: dict, config: dict,
         temp_threshold=config['temp_threshold_move'],
         max_moves=config['max_moves'],
         device=device,
+        top_k_actions=config.get('top_k_actions', 0),
     )
     result_queue.put(examples)
 
@@ -556,6 +557,7 @@ def run_self_play_sequential(network: BlokusNetwork, num_games: int,
             temp_threshold=cfg['mcts']['temp_threshold_move'],
             max_moves=cfg['self_play']['max_moves'],
             device=device,
+            top_k_actions=cfg['mcts'].get('top_k_actions', 0),
         )
         dt = time.time() - t0
         print(f" {len(examples)} examples in {dt:.1f}s")
@@ -920,6 +922,7 @@ def main():
         'max_moves': cfg['self_play']['max_moves'],
         'num_blocks': cfg['network']['num_blocks'],
         'channels': cfg['network']['channels'],
+        'top_k_actions': cfg['mcts'].get('top_k_actions', 0),
     }
 
     num_workers = cfg['self_play']['num_workers']

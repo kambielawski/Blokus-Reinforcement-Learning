@@ -91,7 +91,8 @@ class MCTS:
                  dirichlet_epsilon: float = 0.25,
                  temperature: float = 1.0,
                  device: Optional[torch.device] = None,
-                 batch_size: int = 8):
+                 batch_size: int = 8,
+                 top_k_actions: int = 0):
         self.network = network
         self.c_puct = c_puct
         self.num_simulations = num_simulations
@@ -100,6 +101,7 @@ class MCTS:
         self.temperature = temperature
         self.device = device or torch.device('cpu')
         self.batch_size = batch_size
+        self.top_k_actions = top_k_actions
         # Virtual loss magnitude — discourages re-selecting the same leaf
         self._virtual_loss = 3.0
 
@@ -207,7 +209,7 @@ class MCTS:
                 terminal_leaves.append((node, value))
                 # Apply virtual loss so we don't keep selecting this terminal
                 node.visit_count += 1
-                node.total_value -= self._virtual_loss
+                node.total_value += self._virtual_loss
             else:
                 node.ensure_state()
                 leaves.append(node)
@@ -218,7 +220,7 @@ class MCTS:
         for node, value in terminal_leaves:
             # Remove the temporary visit/loss we added
             node.visit_count -= 1
-            node.total_value += self._virtual_loss
+            node.total_value -= self._virtual_loss
             self._backup(node, value)
 
         if not leaves:
@@ -239,7 +241,7 @@ class MCTS:
         current = node
         while current is not None:
             current.visit_count += 1
-            current.total_value -= self._virtual_loss
+            current.total_value += self._virtual_loss
             current = current.parent
 
     def _remove_virtual_loss(self, node: MCTSNode) -> None:
@@ -247,7 +249,7 @@ class MCTS:
         current = node
         while current is not None:
             current.visit_count -= 1
-            current.total_value += self._virtual_loss
+            current.total_value -= self._virtual_loss
             current = current.parent
 
     # ------------------------------------------------------------------
@@ -261,7 +263,7 @@ class MCTS:
         sqrt_parent = math.sqrt(node.visit_count)
 
         for child in node.children.values():
-            q = child.mean_value
+            q = -child.mean_value
             u = self.c_puct * child.prior * sqrt_parent / (1 + child.visit_count)
             score = q + u
             if score > best_score:
@@ -354,6 +356,13 @@ class MCTS:
         else:
             priors[:] = 1.0 / len(legal)
 
+        # Top-K pruning: only expand the most promising actions
+        if self.top_k_actions > 0 and len(legal) > self.top_k_actions:
+            top_indices = np.argpartition(priors, -self.top_k_actions)[-self.top_k_actions:]
+            legal = [legal[i] for i in top_indices]
+            priors = priors[top_indices]
+            priors /= priors.sum()
+
         # Add Dirichlet noise at root (skip if alpha <= 0)
         if add_noise and len(legal) > 0 and self.dirichlet_alpha > 0:
             noise = np.random.dirichlet(
@@ -435,10 +444,7 @@ class MCTS:
         """Get value for a terminal node from actual game rewards."""
         state = node.ensure_state()
         rewards = state.get_rewards()
-        if node.parent is not None:
-            agent = node.parent.ensure_state().get_current_agent()
-        else:
-            agent = state.get_current_agent()
+        agent = state.get_current_agent()
         return rewards.get(agent, 0.0)
 
     def _backup(self, node: MCTSNode, value: float) -> None:
