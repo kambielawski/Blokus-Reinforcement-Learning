@@ -153,20 +153,25 @@ class CheckpointManager:
         torch.save(payload, iter_path)
 
         # Save replay buffer separately using np.savez (streams arrays to
-        # disk without pickle, avoiding the ~27 GB serialization copy that
-        # torch.save/pickle would create).
+        # disk without pickle).
         if replay_state is not None:
             buf_path = os.path.join(self.save_dir, 'replay_buffer.npz')
-            np.savez(
-                buf_path,
-                max_size=np.array(replay_state['max_size']),
-                size=np.array(replay_state['size']),
-                board_states=replay_state['board_states'],
-                pieces_remaining=replay_state['pieces_remaining'],
-                legal_masks=replay_state['legal_masks'],
-                policy_targets=replay_state['policy_targets'],
-                value_targets=replay_state['value_targets'],
-            )
+            save_kwargs = {
+                'max_size': np.array(replay_state['max_size']),
+                'size': np.array(replay_state['size']),
+                'board_states': replay_state['board_states'],
+                'pieces_remaining': replay_state['pieces_remaining'],
+                'value_targets': replay_state['value_targets'],
+            }
+            # Sparse CSR format (new) or legacy dense format
+            if 'sparse_offsets' in replay_state:
+                save_kwargs['sparse_offsets'] = replay_state['sparse_offsets']
+                save_kwargs['sparse_indices'] = replay_state['sparse_indices']
+                save_kwargs['sparse_policy'] = replay_state['sparse_policy']
+            else:
+                save_kwargs['legal_masks'] = replay_state['legal_masks']
+                save_kwargs['policy_targets'] = replay_state['policy_targets']
+            np.savez(buf_path, **save_kwargs)
 
         return iter_path
 
@@ -230,84 +235,52 @@ class CheckpointManager:
 # ---------------------------------------------------------------------------
 
 class ReplayBuffer:
-    """Rolling FIFO buffer using contiguous columnar numpy arrays.
+    """Rolling FIFO buffer with sparse storage for legal masks and policies.
 
-    Stores data in pre-allocated arrays to avoid per-example Python object
-    overhead and eliminate the need for np.stack copies during training and
-    checkpointing.  At 50K examples the dense arrays use ~27 GB; the old
-    list-of-objects design tripled that during checkpointing/training due to
-    intermediate copies.
+    Dense columns (board_state, pieces_remaining, value_target) use
+    pre-allocated numpy arrays with geometric growth.  Legal masks and
+    policy targets are stored as sparse index/value pairs (lists of small
+    arrays), reducing per-example memory from ~533 KB to ~14 KB.
 
-    Memory layout (per example, float32):
+    Memory layout (per example, avg ~500 legal actions):
         board_state:      5 * 20 * 20 = 2,000 floats  (8 KB)
         pieces_remaining: 84 floats                    (336 B)
-        legal_mask:       67,200 floats                (262 KB)
-        policy_target:    67,200 floats                (262 KB)
+        legal_indices:    ~500 int32                   (~2 KB)
+        policy_values:    ~500 float32                 (~2 KB)
         value_target:     1 float                      (4 B)
-        Total: ~533 KB/example, ~26 GB for 50K examples
+        Total: ~12 KB/example, ~2.4 GB for 200K examples
     """
 
-    # Shapes that don't depend on data (set once on first add or load)
     _BOARD_SHAPE = (5, 20, 20)
     _PIECES_SHAPE = (84,)
     _ACTION_SIZE = 67200
 
     def __init__(self, max_size: int):
         self.max_size = max_size
-        self._size = 0  # Number of valid examples
-        # Columnar storage — allocated lazily on first add/load
+        self._size = 0
+        # Dense columnar storage — allocated lazily on first add/load
         self._board_states: Optional[np.ndarray] = None
         self._pieces_remaining: Optional[np.ndarray] = None
-        self._legal_masks: Optional[np.ndarray] = None
-        self._policy_targets: Optional[np.ndarray] = None
         self._value_targets: Optional[np.ndarray] = None
-
-    def _ensure_capacity(self, needed: int):
-        """Grow backing arrays to hold at least `needed` examples.
-
-        Uses geometric growth (2x) capped at max_size to amortize
-        allocation cost while not pre-allocating the full 27 GB upfront.
-        """
-        if self._board_states is not None and self._board_states.shape[0] >= needed:
-            return
-        cap = min(max(needed, (self._board_states.shape[0] * 2
-                                if self._board_states is not None else needed)),
-                  self.max_size)
-        cap = max(cap, needed)  # ensure we can fit
-
-        old_bs = self._board_states
-        self._board_states = np.empty((cap, *self._BOARD_SHAPE), dtype=np.float32)
-        self._pieces_remaining = np.empty((cap, *self._PIECES_SHAPE), dtype=np.float32)
-        self._legal_masks = np.empty((cap, self._ACTION_SIZE), dtype=np.float32)
-        self._policy_targets = np.empty((cap, self._ACTION_SIZE), dtype=np.float32)
-        self._value_targets = np.empty(cap, dtype=np.float32)
-
-        # Copy old data if any
-        if old_bs is not None and self._size > 0:
-            n = self._size
-            self._board_states[:n] = old_bs[:n]
-            # We need to preserve the old arrays too — but they were just
-            # replaced. Use a different approach: reallocate all at once.
-            # This is called rarely (geometric growth), so the copy is OK.
+        # Sparse storage — lists of small arrays, one per example
+        self._legal_indices: List[np.ndarray] = []   # each (nnz,) int32
+        self._policy_values: List[np.ndarray] = []   # each (nnz,) float32
 
     def _grow_and_copy(self, new_cap: int):
-        """Reallocate all arrays to new_cap, preserving existing data."""
+        """Reallocate dense arrays to new_cap, preserving existing data."""
         n = self._size
-        old = (self._board_states, self._pieces_remaining,
-               self._legal_masks, self._policy_targets, self._value_targets)
+        old_bs = self._board_states
+        old_pr = self._pieces_remaining
+        old_vt = self._value_targets
 
         self._board_states = np.empty((new_cap, *self._BOARD_SHAPE), dtype=np.float32)
         self._pieces_remaining = np.empty((new_cap, *self._PIECES_SHAPE), dtype=np.float32)
-        self._legal_masks = np.empty((new_cap, self._ACTION_SIZE), dtype=np.float32)
-        self._policy_targets = np.empty((new_cap, self._ACTION_SIZE), dtype=np.float32)
         self._value_targets = np.empty(new_cap, dtype=np.float32)
 
-        if old[0] is not None and n > 0:
-            self._board_states[:n] = old[0][:n]
-            self._pieces_remaining[:n] = old[1][:n]
-            self._legal_masks[:n] = old[2][:n]
-            self._policy_targets[:n] = old[3][:n]
-            self._value_targets[:n] = old[4][:n]
+        if old_bs is not None and n > 0:
+            self._board_states[:n] = old_bs[:n]
+            self._pieces_remaining[:n] = old_pr[:n]
+            self._value_targets[:n] = old_vt[:n]
 
     def add(self, examples: List[TrainingExample]) -> int:
         """Add examples, dropping oldest if over capacity. Returns count dropped."""
@@ -320,39 +293,40 @@ class ReplayBuffer:
         dropped = max(0, total - self.max_size)
         new_size = min(total, self.max_size)
 
-        # Determine how many old examples survive
         keep_old = old_size - dropped if dropped < old_size else 0
-
-        # How many new examples to take (if n_new > max_size, skip earliest)
         skip_new = max(0, n_new - self.max_size)
-        take_new = n_new - skip_new
 
-        # Ensure we have enough capacity
+        # Ensure dense capacity
         cur_cap = self._board_states.shape[0] if self._board_states is not None else 0
-        needed = new_size
-        if cur_cap < needed:
-            new_cap = min(max(needed, cur_cap * 2), self.max_size)
-            new_cap = max(new_cap, needed)
+        if cur_cap < new_size:
+            new_cap = min(max(new_size, cur_cap * 2), self.max_size)
+            new_cap = max(new_cap, new_size)
             self._grow_and_copy(new_cap)
 
-        # Shift surviving old data to front (if dropping)
+        # Drop oldest from sparse lists
+        if dropped > 0:
+            drop_count = min(dropped, len(self._legal_indices))
+            self._legal_indices = self._legal_indices[drop_count:]
+            self._policy_values = self._policy_values[drop_count:]
+
+        # Shift surviving dense data to front
         if dropped > 0 and keep_old > 0:
             src_start = old_size - keep_old
             self._board_states[:keep_old] = self._board_states[src_start:old_size]
             self._pieces_remaining[:keep_old] = self._pieces_remaining[src_start:old_size]
-            self._legal_masks[:keep_old] = self._legal_masks[src_start:old_size]
-            self._policy_targets[:keep_old] = self._policy_targets[src_start:old_size]
             self._value_targets[:keep_old] = self._value_targets[src_start:old_size]
 
-        # Copy new examples one at a time (avoids np.stack temporary)
+        # Add new examples
         dst = keep_old
         for i in range(skip_new, n_new):
             ex = examples[i]
             self._board_states[dst] = ex.board_state
             self._pieces_remaining[dst] = ex.pieces_remaining
-            self._legal_masks[dst] = ex.legal_mask
-            self._policy_targets[dst] = ex.policy_target
             self._value_targets[dst] = ex.value_target
+            # Convert dense → sparse
+            nonzero = np.nonzero(ex.legal_mask)[0].astype(np.int32)
+            self._legal_indices.append(nonzero)
+            self._policy_values.append(ex.policy_target[nonzero].astype(np.float32).copy())
             dst += 1
 
         self._size = new_size
@@ -366,106 +340,159 @@ class ReplayBuffer:
         """Direct view of value targets (no copy)."""
         return self._value_targets[:self._size]
 
-    def sample(self, n: int) -> List[TrainingExample]:
-        """Sample n examples uniformly at random (for tests/compat)."""
-        if self._size == 0:
-            return []
-        indices = np.random.randint(0, self._size, size=min(n, self._size))
-        return [
-            TrainingExample(
-                board_state=self._board_states[i],
-                pieces_remaining=self._pieces_remaining[i],
-                legal_mask=self._legal_masks[i],
-                policy_target=self._policy_targets[i],
-                value_target=float(self._value_targets[i]),
-            )
-            for i in indices
-        ]
+    def _reconstruct_dense(self, idx: int):
+        """Reconstruct dense legal_mask and policy_target for one example."""
+        legal_mask = np.zeros(self._ACTION_SIZE, dtype=np.float32)
+        policy_target = np.zeros(self._ACTION_SIZE, dtype=np.float32)
+        indices = self._legal_indices[idx]
+        legal_mask[indices] = 1.0
+        policy_target[indices] = self._policy_values[idx]
+        return legal_mask, policy_target
 
-    def get_all(self) -> List[TrainingExample]:
-        """Reconstruct list of TrainingExample objects (for tests/compat).
+    def reconstruct_sparse_batch(self, indices: np.ndarray):
+        """Reconstruct dense legal_masks and policy_targets for a mini-batch.
 
-        WARNING: This creates per-example Python objects and numpy views.
-        Do NOT use in the hot training path — use get_training_tensors().
+        Args:
+            indices: 1D array of example indices (int).
+
+        Returns:
+            (legal_masks, policy_targets) as numpy arrays of shape
+            (len(indices), ACTION_SIZE), dtype float32.
         """
-        n = self._size
-        return [
-            TrainingExample(
-                board_state=self._board_states[i],
-                pieces_remaining=self._pieces_remaining[i],
-                legal_mask=self._legal_masks[i],
-                policy_target=self._policy_targets[i],
-                value_target=float(self._value_targets[i]),
-            )
-            for i in range(n)
-        ]
+        n = len(indices)
+        legal_masks = np.zeros((n, self._ACTION_SIZE), dtype=np.float32)
+        policy_targets = np.zeros((n, self._ACTION_SIZE), dtype=np.float32)
+        for i, idx in enumerate(indices):
+            li = self._legal_indices[idx]
+            legal_masks[i, li] = 1.0
+            policy_targets[i, li] = self._policy_values[idx]
+        return legal_masks, policy_targets
 
-    def get_training_tensors(self):
-        """Return sliced views as torch tensors (zero-copy via from_numpy).
+    def get_dense_tensors(self):
+        """Return dense columns as CPU tensors (zero-copy via from_numpy).
 
-        Returns (board_states, pieces_vecs, legal_masks, policy_targets,
-                 value_targets) — all on CPU.
+        Returns (board_states, pieces_vecs, value_targets).
         """
         n = self._size
         return (
             torch.from_numpy(self._board_states[:n]),
             torch.from_numpy(self._pieces_remaining[:n]),
-            torch.from_numpy(self._legal_masks[:n]),
-            torch.from_numpy(self._policy_targets[:n]),
             torch.from_numpy(self._value_targets[:n]),
         )
 
-    def state_dict(self) -> dict:
-        """Serialize for checkpointing.
+    def sample(self, n: int) -> List[TrainingExample]:
+        """Sample n examples uniformly at random (for tests/compat)."""
+        if self._size == 0:
+            return []
+        indices = np.random.randint(0, self._size, size=min(n, self._size))
+        results = []
+        for i in indices:
+            lm, pt = self._reconstruct_dense(i)
+            results.append(TrainingExample(
+                board_state=self._board_states[i],
+                pieces_remaining=self._pieces_remaining[i],
+                legal_mask=lm,
+                policy_target=pt,
+                value_target=float(self._value_targets[i]),
+            ))
+        return results
 
-        Returns contiguous arrays of the active region. When the buffer is
-        full (size == capacity), returns views to avoid a 27 GB copy.
-        When partially filled, returns copies so pickle doesn't serialize
-        the unused portion of the backing array.
+    def get_all(self) -> List[TrainingExample]:
+        """Reconstruct list of TrainingExample objects (for tests/compat).
+
+        WARNING: This creates per-example Python objects with dense arrays.
+        Do NOT use in the hot training path.
+        """
+        n = self._size
+        results = []
+        for i in range(n):
+            lm, pt = self._reconstruct_dense(i)
+            results.append(TrainingExample(
+                board_state=self._board_states[i],
+                pieces_remaining=self._pieces_remaining[i],
+                legal_mask=lm,
+                policy_target=pt,
+                value_target=float(self._value_targets[i]),
+            ))
+        return results
+
+    def state_dict(self) -> dict:
+        """Serialize for checkpointing using CSR-style sparse format.
+
+        Sparse data is flattened into three arrays: offsets, indices, values.
+        This is compact and compatible with np.savez streaming.
         """
         if self._size == 0:
             return {'max_size': self.max_size, 'size': 0}
         n = self._size
         cap = self._board_states.shape[0]
+        # Dense columns
         if n == cap:
-            # Buffer is exactly full — views are safe (no unused tail)
-            return {
-                'max_size': self.max_size,
-                'size': n,
-                'board_states': self._board_states,
-                'pieces_remaining': self._pieces_remaining,
-                'legal_masks': self._legal_masks,
-                'policy_targets': self._policy_targets,
-                'value_targets': self._value_targets,
-            }
-        # Partially filled — copy to avoid serializing unused space
+            bs, pr, vt = self._board_states, self._pieces_remaining, self._value_targets
+        else:
+            bs = self._board_states[:n].copy()
+            pr = self._pieces_remaining[:n].copy()
+            vt = self._value_targets[:n].copy()
+        # Sparse columns → CSR
+        offsets = np.zeros(n + 1, dtype=np.int64)
+        for i in range(n):
+            offsets[i + 1] = offsets[i] + len(self._legal_indices[i])
+        total_nnz = int(offsets[n])
+        flat_indices = np.empty(total_nnz, dtype=np.int32)
+        flat_policy = np.empty(total_nnz, dtype=np.float32)
+        for i in range(n):
+            start, end = int(offsets[i]), int(offsets[i + 1])
+            flat_indices[start:end] = self._legal_indices[i]
+            flat_policy[start:end] = self._policy_values[i]
         return {
             'max_size': self.max_size,
             'size': n,
-            'board_states': self._board_states[:n].copy(),
-            'pieces_remaining': self._pieces_remaining[:n].copy(),
-            'legal_masks': self._legal_masks[:n].copy(),
-            'policy_targets': self._policy_targets[:n].copy(),
-            'value_targets': self._value_targets[:n].copy(),
+            'board_states': bs,
+            'pieces_remaining': pr,
+            'value_targets': vt,
+            'sparse_offsets': offsets,
+            'sparse_indices': flat_indices,
+            'sparse_policy': flat_policy,
         }
 
     def load_state_dict(self, state: dict) -> None:
-        """Restore buffer from checkpoint."""
+        """Restore buffer from checkpoint (supports both sparse and legacy dense)."""
         self.max_size = state.get('max_size', self.max_size)
         n = state.get('size', 0)
         if n == 0 and 'board_states' not in state:
             self._size = 0
-            self._board_states = None  # will be re-allocated on next add
+            self._board_states = None
+            self._legal_indices = []
+            self._policy_values = []
             return
-        # Handle older checkpoints that don't have 'size'
         if n == 0 and 'board_states' in state:
             n = len(state['board_states'])
+        # Dense columns
         self._grow_and_copy(max(n, 1))
         self._board_states[:n] = state['board_states'][:n]
         self._pieces_remaining[:n] = state['pieces_remaining'][:n]
-        self._legal_masks[:n] = state['legal_masks'][:n]
-        self._policy_targets[:n] = state['policy_targets'][:n]
         self._value_targets[:n] = state['value_targets'][:n]
+        # Sparse columns
+        if 'sparse_offsets' in state:
+            offsets = state['sparse_offsets']
+            flat_indices = state['sparse_indices']
+            flat_policy = state['sparse_policy']
+            self._legal_indices = []
+            self._policy_values = []
+            for i in range(n):
+                start, end = int(offsets[i]), int(offsets[i + 1])
+                self._legal_indices.append(flat_indices[start:end].copy())
+                self._policy_values.append(flat_policy[start:end].copy())
+        else:
+            # Legacy dense format — convert to sparse on load
+            self._legal_indices = []
+            self._policy_values = []
+            lm = state['legal_masks']
+            pt = state['policy_targets']
+            for i in range(n):
+                nonzero = np.nonzero(lm[i])[0].astype(np.int32)
+                self._legal_indices.append(nonzero)
+                self._policy_values.append(pt[i][nonzero].astype(np.float32).copy())
         self._size = n
 
 
@@ -581,14 +608,14 @@ def train_on_examples(network: BlokusNetwork,
 
     Loss = policy_loss + value_loss_weight * MSE(value_pred, value_target)
 
-    Data stays on CPU as zero-copy torch views of the buffer's numpy arrays;
-    only each mini-batch is moved to the device.
+    Dense columns (board, pieces, value) are zero-copy CPU tensor views.
+    Sparse columns (legal_mask, policy_target) are reconstructed per
+    mini-batch from the buffer's compressed storage.
     """
     network.train()
 
-    # Zero-copy CPU tensors backed by the buffer's numpy arrays
-    board_states, pieces_vecs, legal_masks, policy_targets, value_targets = \
-        replay_buffer.get_training_tensors()
+    # Zero-copy CPU tensors for dense columns
+    board_states, pieces_vecs, value_targets = replay_buffer.get_dense_tensors()
 
     n = len(replay_buffer)
     total_policy_loss = 0.0
@@ -602,12 +629,15 @@ def train_on_examples(network: BlokusNetwork,
             end = min(i + batch_size, n)
             idx = perm[i:end]
 
-            # Move only this mini-batch to device
+            # Dense columns — move to device
             bs = board_states[idx].to(device, non_blocking=True)
             pv = pieces_vecs[idx].to(device, non_blocking=True)
-            lm = legal_masks[idx].to(device, non_blocking=True)
-            pt = policy_targets[idx].to(device, non_blocking=True)
             vt = value_targets[idx].to(device, non_blocking=True)
+
+            # Sparse → dense reconstruction for this mini-batch
+            lm_np, pt_np = replay_buffer.reconstruct_sparse_batch(idx.numpy())
+            lm = torch.from_numpy(lm_np).to(device, non_blocking=True)
+            pt = torch.from_numpy(pt_np).to(device, non_blocking=True)
 
             optimizer.zero_grad()
             log_policy, value_pred = network(bs, pv, lm)
@@ -630,13 +660,16 @@ def train_on_examples(network: BlokusNetwork,
             end = min(i + batch_size, n)
             bs = board_states[i:end].to(device, non_blocking=True)
             pv = pieces_vecs[i:end].to(device, non_blocking=True)
-            lm = legal_masks[i:end].to(device, non_blocking=True)
             vt = value_targets[i:end]
+
+            # Reconstruct sparse for this batch
+            batch_idx = np.arange(i, end)
+            lm_np, _ = replay_buffer.reconstruct_sparse_batch(batch_idx)
+            lm = torch.from_numpy(lm_np).to(device, non_blocking=True)
 
             _, value_pred = network(bs, pv, lm)
             vp = value_pred.cpu()
 
-            # Only count examples with non-zero target (skip draws)
             mask = vt != 0
             non_draw += mask.sum().item()
             correct += ((vp[mask] > 0) == (vt[mask] > 0)).sum().item()

@@ -411,6 +411,80 @@ class TestReplayBuffer:
         for ex in sample:
             assert isinstance(ex, TrainingExample)
 
+    def test_sparse_storage_correctness(self, train_module):
+        """Sparse storage faithfully reconstructs dense legal_mask and policy_target."""
+        # Create examples with realistic sparse masks (~100 legal actions)
+        examples = []
+        for i in range(10):
+            legal_mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
+            policy_target = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
+            rng = np.random.RandomState(i)
+            n_legal = rng.randint(50, 500)
+            legal_actions = rng.choice(ACTION_SPACE_SIZE, size=n_legal, replace=False)
+            legal_mask[legal_actions] = 1.0
+            probs = rng.dirichlet(np.ones(n_legal))
+            policy_target[legal_actions] = probs.astype(np.float32)
+            examples.append(TrainingExample(
+                board_state=rng.randn(5, 20, 20).astype(np.float32),
+                pieces_remaining=rng.randint(0, 2, size=84).astype(np.float32),
+                legal_mask=legal_mask,
+                policy_target=policy_target,
+                value_target=float(rng.choice([-1.0, 0.0, 1.0])),
+            ))
+        buf = train_module.ReplayBuffer(max_size=1000)
+        buf.add(examples)
+        # Verify get_all reconstructs correctly
+        recovered = buf.get_all()
+        for orig, rec in zip(examples, recovered):
+            np.testing.assert_array_equal(rec.legal_mask, orig.legal_mask)
+            np.testing.assert_allclose(rec.policy_target, orig.policy_target, atol=1e-7)
+            np.testing.assert_array_equal(rec.board_state, orig.board_state)
+            assert rec.value_target == orig.value_target
+        # Verify reconstruct_sparse_batch
+        idx = np.array([0, 5, 9])
+        lm, pt = buf.reconstruct_sparse_batch(idx)
+        for i, j in enumerate(idx):
+            np.testing.assert_array_equal(lm[i], examples[j].legal_mask)
+            np.testing.assert_allclose(pt[i], examples[j].policy_target, atol=1e-7)
+
+    def test_sparse_checkpoint_roundtrip(self, train_module):
+        """Sparse CSR checkpoint format preserves data correctly."""
+        rng = np.random.RandomState(42)
+        examples = []
+        for i in range(50):
+            legal_mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
+            policy_target = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
+            n_legal = rng.randint(100, 300)
+            legal_actions = rng.choice(ACTION_SPACE_SIZE, size=n_legal, replace=False)
+            legal_mask[legal_actions] = 1.0
+            probs = rng.dirichlet(np.ones(n_legal))
+            policy_target[legal_actions] = probs.astype(np.float32)
+            examples.append(TrainingExample(
+                board_state=rng.randn(5, 20, 20).astype(np.float32),
+                pieces_remaining=rng.randint(0, 2, size=84).astype(np.float32),
+                legal_mask=legal_mask,
+                policy_target=policy_target,
+                value_target=float(rng.choice([-1.0, 1.0])),
+            ))
+        buf = train_module.ReplayBuffer(max_size=500)
+        buf.add(examples)
+        state = buf.state_dict()
+        # Verify CSR keys exist
+        assert 'sparse_offsets' in state
+        assert 'sparse_indices' in state
+        assert 'sparse_policy' in state
+        assert 'legal_masks' not in state  # no dense masks
+        # Roundtrip
+        buf2 = train_module.ReplayBuffer(max_size=100)
+        buf2.load_state_dict(state)
+        assert len(buf2) == 50
+        assert buf2.max_size == 500
+        recovered = buf2.get_all()
+        for orig, rec in zip(examples, recovered):
+            np.testing.assert_array_equal(rec.legal_mask, orig.legal_mask)
+            np.testing.assert_allclose(rec.policy_target, orig.policy_target, atol=1e-7)
+            assert rec.value_target == orig.value_target
+
 
 class TestTraining:
     """Tests for the training loop."""
