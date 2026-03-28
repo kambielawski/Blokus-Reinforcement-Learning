@@ -23,6 +23,10 @@ training:
   iterations: 100
   replay_buffer_size: 30000       # Max examples in rolling buffer (0 = no buffer)
   value_loss_weight: 10.0         # Multiplier for value loss in total loss (high to balance 67K-action policy CE)
+  lr_schedule:
+    enabled: false                # Set true to use cosine decay with warmup
+    warmup_iters: 5               # Linear warmup from min_lr to learning_rate
+    min_lr: 0.0001                # Minimum LR at end of cosine decay
 
 self_play:
   games_per_iteration: 10

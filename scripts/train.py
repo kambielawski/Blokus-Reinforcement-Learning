@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import glob
+import math
 import os
 import sys
 import time
@@ -1008,11 +1009,32 @@ def main():
     total_iterations = cfg['training']['iterations']
     end_iteration = start_iteration + total_iterations - 1
 
+    # LR schedule: cosine decay with linear warmup
+    lr_cfg = cfg['training'].get('lr_schedule', {})
+    lr_schedule_enabled = lr_cfg.get('enabled', False)
+    lr_warmup_iters = lr_cfg.get('warmup_iters', 5)
+    lr_min = lr_cfg.get('min_lr', 0.0001)
+    base_lr = cfg['training']['learning_rate']
+
+    def get_lr(iteration: int) -> float:
+        """Compute learning rate for a given iteration (1-indexed)."""
+        if not lr_schedule_enabled:
+            return base_lr
+        if iteration <= lr_warmup_iters:
+            # Linear warmup from min_lr to base_lr
+            return lr_min + (base_lr - lr_min) * (iteration / lr_warmup_iters)
+        # Cosine decay from base_lr to min_lr over remaining iterations
+        progress = (iteration - lr_warmup_iters) / max(end_iteration - lr_warmup_iters, 1)
+        return lr_min + 0.5 * (base_lr - lr_min) * (1 + math.cos(math.pi * progress))
+
     # Print config summary
+    lr_info = f"lr={base_lr}"
+    if lr_schedule_enabled:
+        lr_info = f"lr={base_lr}→{lr_min} (cosine, warmup={lr_warmup_iters})"
     print(f"\nConfig: {total_iterations} iterations, "
           f"{cfg['self_play']['games_per_iteration']} games/iter, "
           f"{cfg['mcts']['num_simulations']} sims, "
-          f"lr={cfg['training']['learning_rate']}")
+          f"{lr_info}")
 
     # Training loop
     for iteration in range(start_iteration, end_iteration + 1):
@@ -1068,6 +1090,11 @@ def main():
               f"range=[{vt_min:+.3f}, {vt_max:+.3f}]")
         print(f"  Value targets (iter):   mean={iter_vt_mean:+.4f}, std={iter_vt_std:.4f}")
 
+        # ------ Adjust learning rate ------
+        current_lr = get_lr(iteration)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = current_lr
+
         # ------ Training (on full buffer) ------
         t_tr = time.time()
         stats = train_on_examples(
@@ -1097,7 +1124,8 @@ def main():
         print(f"  Training: policy_loss={stats['policy_loss']:.4f}, "
               f"value_loss={stats['value_loss']:.4f}, "
               f"total_loss={stats['total_loss']:.4f}, "
-              f"value_acc={stats['value_accuracy']:.1%} "
+              f"value_acc={stats['value_accuracy']:.1%}, "
+              f"lr={current_lr:.6f} "
               f"({train_time:.1f}s)")
 
         # ------ Checkpoint ------
@@ -1156,6 +1184,7 @@ def main():
                 'iter_value_target_mean': iter_vt_mean,
                 'iter_value_target_std': iter_vt_std,
                 'value_accuracy': stats['value_accuracy'],
+                'learning_rate': current_lr,
             }
             log_data.update(eval_metrics)
             wandb.log(log_data, step=iteration)
