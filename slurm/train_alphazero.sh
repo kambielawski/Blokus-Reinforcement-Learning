@@ -31,8 +31,8 @@ echo "Python:    $(python3 --version)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo "GPU: N/A"
 echo "================================================"
 
-# Config file (default: configs/full.yaml)
-CONFIG="${TRAIN_CONFIG:-configs/bugfix-v1.yaml}"
+# Config file (default: configs/scale-v1.yaml)
+CONFIG="${TRAIN_CONFIG:-configs/scale-v1.yaml}"
 
 # Extra CLI args
 ARGS="${TRAIN_ARGS:-}"
