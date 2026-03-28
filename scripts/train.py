@@ -690,8 +690,11 @@ def train_on_examples(network: BlokusNetwork,
 # Periodic Evaluation vs Random
 # ---------------------------------------------------------------------------
 
-def _eval_select_action_raw(network, state, device):
-    """Select action using raw network policy (greedy, no MCTS)."""
+def _eval_select_action_raw(network, state, device, value_preds=None):
+    """Select action using raw network policy (greedy, no MCTS).
+
+    If value_preds list is provided, appends the value prediction for this state.
+    """
     legal = state.get_legal_actions()
     if not legal:
         return -1
@@ -699,7 +702,9 @@ def _eval_select_action_raw(network, state, device):
     pieces = torch.from_numpy(make_pieces_remaining_vector(state)).unsqueeze(0).to(device)
     mask = torch.from_numpy(state.get_legal_actions_mask()).unsqueeze(0).to(device)
     with torch.no_grad():
-        log_policy, _ = network(board, pieces, mask)
+        log_policy, value = network(board, pieces, mask)
+    if value_preds is not None:
+        value_preds.append(value.item())
     probs = torch.exp(log_policy).squeeze(0).cpu().numpy()
     best_a, best_p = legal[0], -1.0
     for a in legal:
@@ -709,11 +714,15 @@ def _eval_select_action_raw(network, state, device):
     return best_a
 
 
-def _eval_play_game(network, device, mode, mcts_sims, game_mode):
+def _eval_play_game(network, device, mode, mcts_sims, game_mode,
+                    value_preds=None):
     """Play one eval game: trained agent (agent 0) vs random (agent 1).
 
     Returns (winner, score_diff) where winner is 0/1/-1 and
     score_diff = trained_score - random_score.
+
+    If value_preds list is provided, collects value predictions from
+    raw policy mode for diagnostics.
     """
     state = GameState.new_game(game_mode)
     mcts = None
@@ -739,7 +748,8 @@ def _eval_play_game(network, device, mode, mcts_sims, game_mode):
             if mode == 'mcts':
                 action, _, _ = mcts.select_action(state)
             else:
-                action = _eval_select_action_raw(network, state, device)
+                action = _eval_select_action_raw(network, state, device,
+                                                  value_preds=value_preds)
         else:
             action = legal[np.random.randint(len(legal))]
 
@@ -766,9 +776,14 @@ def _eval_play_game(network, device, mode, mcts_sims, game_mode):
 
 
 def evaluate_vs_random(network, device, num_games, mcts_sims, game_mode):
-    """Run eval games for both raw policy and MCTS, return metrics dict."""
+    """Run eval games for both raw policy and MCTS, return metrics dict.
+
+    Also collects value prediction diagnostics (mean/std/min/max of raw
+    value outputs) to detect dead value heads.
+    """
     network.eval()
     results = {}
+    all_value_preds: List[float] = []  # collected during raw eval games
 
     for mode in ('raw', 'mcts'):
         sims = mcts_sims if mode == 'mcts' else 0
@@ -777,8 +792,11 @@ def evaluate_vs_random(network, device, num_games, mcts_sims, game_mode):
 
         t0 = time.time()
         for _ in range(num_games):
+            # Collect value predictions during raw games only
+            vp = all_value_preds if mode == 'raw' else None
             winner, score_diff = _eval_play_game(
-                network, device, mode, sims, game_mode
+                network, device, mode, sims, game_mode,
+                value_preds=vp,
             )
             if winner == 0:
                 wins += 1
@@ -793,6 +811,26 @@ def evaluate_vs_random(network, device, num_games, mcts_sims, game_mode):
         print(f"  Eval ({mode:4s}): win_rate={win_rate:.1%}, "
               f"avg_score_diff={avg_score_diff:+.1f} "
               f"({num_games} games in {elapsed:.1f}s)")
+
+    # Value prediction diagnostics from raw eval games
+    if all_value_preds:
+        vp_arr = np.array(all_value_preds, dtype=np.float32)
+        vp_mean = float(vp_arr.mean())
+        vp_std = float(vp_arr.std())
+        vp_min = float(vp_arr.min())
+        vp_max = float(vp_arr.max())
+        vp_abs_mean = float(np.abs(vp_arr).mean())
+        # Fraction of predictions near zero (|v| < 0.1)
+        vp_near_zero_frac = float((np.abs(vp_arr) < 0.1).mean())
+        results['eval/value_pred_mean'] = vp_mean
+        results['eval/value_pred_std'] = vp_std
+        results['eval/value_pred_min'] = vp_min
+        results['eval/value_pred_max'] = vp_max
+        results['eval/value_pred_abs_mean'] = vp_abs_mean
+        results['eval/value_pred_near_zero_frac'] = vp_near_zero_frac
+        print(f"  Value preds: mean={vp_mean:+.4f}, std={vp_std:.4f}, "
+              f"range=[{vp_min:+.3f}, {vp_max:+.3f}], "
+              f"|v|_mean={vp_abs_mean:.4f}, near_zero={vp_near_zero_frac:.1%}")
 
     network.train()
     return results
