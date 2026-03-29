@@ -1,0 +1,33 @@
+# Experiment: Value head dropout (Fix 1 only)
+
+network:
+  num_blocks: 5
+  channels: 128
+
+mcts:
+  num_simulations: 400
+  top_k_actions: 50
+
+training:
+  learning_rate: 0.001
+  batch_size: 64
+  epochs_per_iter: 5
+  iterations: 100
+  replay_buffer_size: 50000
+  value_loss_weight: 10.0
+  value_dropout: 0.3
+
+self_play:
+  games_per_iteration: 25
+  num_workers: 4
+
+eval:
+  interval: 10
+  games: 200
+  mcts_sims: 25
+
+wandb:
+  enabled: true
+  run_name: exp-dropout
+
+device: auto
