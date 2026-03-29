@@ -989,14 +989,19 @@ def main():
         if ckpt:
             # Handle mismatched FC layer sizes (e.g. resuming non-score-input
             # checkpoint into score-input network)
-            try:
-                network.load_state_dict(ckpt['model_state_dict'])
-            except RuntimeError as e:
-                if 'size mismatch' in str(e):
-                    print(f"  WARNING: Model size mismatch — loading with strict=False")
-                    network.load_state_dict(ckpt['model_state_dict'], strict=False)
-                else:
-                    raise
+            model_sd = network.state_dict()
+            ckpt_sd = ckpt['model_state_dict']
+            mismatched = []
+            for k in list(ckpt_sd.keys()):
+                if k in model_sd and ckpt_sd[k].shape != model_sd[k].shape:
+                    mismatched.append((k, ckpt_sd[k].shape, model_sd[k].shape))
+                    del ckpt_sd[k]
+            if mismatched:
+                for k, old_s, new_s in mismatched:
+                    print(f"  WARNING: Skipping {k}: checkpoint {old_s} != model {new_s}")
+                network.load_state_dict(ckpt_sd, strict=False)
+            else:
+                network.load_state_dict(ckpt_sd)
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
             start_iteration = ckpt.get('iteration', 0) + 1
             cumulative_games = ckpt.get('cumulative_games', 0)
