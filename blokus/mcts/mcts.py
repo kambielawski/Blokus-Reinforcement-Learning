@@ -303,13 +303,15 @@ class MCTS:
 
         Returns list of value estimates, one per leaf.
         """
-        from blokus.nn.network import make_pieces_remaining_vector
+        from blokus.nn.network import make_pieces_remaining_vector, make_score_vector
 
         n = len(leaves)
+        use_scores = getattr(self.network, 'score_input', False)
         # Pre-allocate numpy arrays for the batch
         board_states = np.empty((n, 5, 20, 20), dtype=np.float32)
         pieces_vecs = np.empty((n, NUM_PIECES * NUM_COLORS), dtype=np.float32)
         legal_masks = np.zeros((n, ACTION_SPACE_SIZE), dtype=np.float32)
+        score_vecs = np.empty((n, 4), dtype=np.float32) if use_scores else None
 
         legal_actions_list: List[List[int]] = []
 
@@ -322,9 +324,11 @@ class MCTS:
             pieces_vecs[i] = make_pieces_remaining_vector(state)
             for a in legal:
                 legal_masks[i, a] = 1.0
+            if use_scores:
+                score_vecs[i] = make_score_vector(state)
 
         # Single batched NN forward pass
-        policies, values = self._nn_forward_batch(board_states, pieces_vecs, legal_masks)
+        policies, values = self._nn_forward_batch(board_states, pieces_vecs, legal_masks, score_vecs)
 
         # Create children for each leaf
         for i, node in enumerate(leaves):
@@ -395,7 +399,7 @@ class MCTS:
         Accepts pre-computed legal actions list and optional mask to
         avoid redundant get_legal_actions() calls.
         """
-        from blokus.nn.network import make_pieces_remaining_vector
+        from blokus.nn.network import make_pieces_remaining_vector, make_score_vector
 
         board_np = state.get_nn_state()
         pieces_np = make_pieces_remaining_vector(state)
@@ -405,17 +409,23 @@ class MCTS:
             for a in legal:
                 legal_mask[a] = 1.0
 
+        score_np = None
+        if getattr(self.network, 'score_input', False):
+            score_np = make_score_vector(state)[np.newaxis]
+
         policies, values = self._nn_forward_batch(
             board_np[np.newaxis],
             pieces_np[np.newaxis],
             legal_mask[np.newaxis],
+            score_np,
         )
         return policies[0], values[0]
 
     @torch.no_grad()
     def _nn_forward_batch(self, board_states: np.ndarray,
                           pieces_vecs: np.ndarray,
-                          legal_masks: np.ndarray
+                          legal_masks: np.ndarray,
+                          score_vecs: np.ndarray = None,
                           ) -> Tuple[np.ndarray, List[float]]:
         """Run batched NN forward pass.
 
@@ -423,6 +433,7 @@ class MCTS:
             board_states: (N, 5, 20, 20) float32
             pieces_vecs: (N, 84) float32
             legal_masks: (N, 67200) float32
+            score_vecs: (N, 4) float32 or None
 
         Returns:
             policies: (N, 67200) probability arrays
@@ -431,9 +442,12 @@ class MCTS:
         board_t = torch.from_numpy(board_states).to(self.device)
         pieces_t = torch.from_numpy(pieces_vecs).to(self.device)
         mask_t = torch.from_numpy(legal_masks).to(self.device)
+        score_t = None
+        if score_vecs is not None:
+            score_t = torch.from_numpy(score_vecs).to(self.device)
 
         self.network.eval()
-        log_policy, value = self.network(board_t, pieces_t, mask_t)
+        log_policy, value = self.network(board_t, pieces_t, mask_t, score_vector=score_t)
 
         policies = torch.exp(log_policy).cpu().numpy()
         values = value.cpu().tolist()

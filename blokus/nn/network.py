@@ -29,6 +29,10 @@ POLICY_CHANNELS = NUM_PIECES * MAX_ORIENTATIONS  # 168
 # Piece-remaining vector size: 21 pieces * 4 colors = 84
 PIECE_REMAINING_SIZE = NUM_PIECES * NUM_COLORS  # 84
 
+# Score vector size: 4 colors, normalized by max possible score
+SCORE_VECTOR_SIZE = NUM_COLORS  # 4
+MAX_SCORE_PER_COLOR = 89  # 21 pieces = 89 total squares
+
 
 class ResidualBlock(nn.Module):
     """Single residual block: two 3x3 convs with batch norm and skip connection."""
@@ -58,10 +62,12 @@ class BlokusNetwork(nn.Module):
     """
 
     def __init__(self, num_blocks: int = 5, channels: int = 128,
-                 value_fc_size: int = 256):
+                 value_fc_size: int = 256, value_dropout: float = 0.0,
+                 score_input: bool = False):
         super().__init__()
         self.num_blocks = num_blocks
         self.channels = channels
+        self.score_input = score_input
 
         # --- Backbone ---
         self.input_conv = nn.Conv2d(INPUT_CHANNELS, channels, 3, padding=1, bias=False)
@@ -81,15 +87,18 @@ class BlokusNetwork(nn.Module):
         # --- Value head ---
         self.value_conv = nn.Conv2d(channels, 1, 1, bias=False)
         self.value_bn = nn.BatchNorm2d(1)
+        value_extra_input = SCORE_VECTOR_SIZE if score_input else 0
         self.value_fc1 = nn.Linear(
-            BOARD_SIZE * BOARD_SIZE + PIECE_REMAINING_SIZE,
+            BOARD_SIZE * BOARD_SIZE + PIECE_REMAINING_SIZE + value_extra_input,
             value_fc_size,
         )
+        self.value_dropout = nn.Dropout(p=value_dropout) if value_dropout > 0 else None
         self.value_fc2 = nn.Linear(value_fc_size, 1)
 
     def forward(self, board_state: torch.Tensor,
                 pieces_remaining: torch.Tensor,
-                legal_actions_mask: torch.Tensor
+                legal_actions_mask: torch.Tensor,
+                score_vector: torch.Tensor = None,
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
 
@@ -99,6 +108,8 @@ class BlokusNetwork(nn.Module):
                 player still has (21 pieces * 4 colors, in turn order starting
                 from current player).
             legal_actions_mask: (batch, 67200) binary float32 — 1 for legal actions.
+            score_vector: (batch, 4) float32 — normalized scores per color in
+                turn order. Only used when score_input=True.
 
         Returns:
             policy: (batch, 67200) log-probabilities (masked softmax).
@@ -124,8 +135,13 @@ class BlokusNetwork(nn.Module):
         # --- Value head ---
         v = F.relu(self.value_bn(self.value_conv(x)))
         v = v.view(v.size(0), -1)  # (batch, 400)
-        v = torch.cat([v, pieces_remaining], dim=1)  # (batch, 400+84)
+        value_inputs = [v, pieces_remaining]
+        if self.score_input and score_vector is not None:
+            value_inputs.append(score_vector)
+        v = torch.cat(value_inputs, dim=1)
         v = F.relu(self.value_fc1(v))
+        if self.value_dropout is not None:
+            v = self.value_dropout(v)
         v = torch.tanh(self.value_fc2(v)).squeeze(-1)  # (batch,)
 
         return log_policy, v
@@ -146,4 +162,21 @@ def make_pieces_remaining_vector(state) -> np.ndarray:
         offset = i * NUM_PIECES
         for pid in state.pieces_remaining[color]:
             vec[offset + pid] = 1.0
+    return vec
+
+
+def make_score_vector(state) -> np.ndarray:
+    """Build a 4-dim normalized score vector from a GameState.
+
+    Layout: 4 colors in turn order (starting from current player),
+    each score normalized by max possible score (89).
+
+    Returns: (4,) float32 numpy array.
+    """
+    scores = state.get_scores()
+    vec = np.zeros(SCORE_VECTOR_SIZE, dtype=np.float32)
+    current = state.current_color
+    for i in range(NUM_COLORS):
+        color = (current + i) % NUM_COLORS
+        vec[i] = scores.get(color, 0) / MAX_SCORE_PER_COLOR
     return vec

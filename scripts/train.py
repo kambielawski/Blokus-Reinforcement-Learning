@@ -36,7 +36,7 @@ from typing import List, Dict, Any, Optional
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
-from blokus.nn.network import BlokusNetwork, make_pieces_remaining_vector
+from blokus.nn.network import BlokusNetwork, make_pieces_remaining_vector, make_score_vector
 from blokus.agents.alpha_zero import self_play_game, TrainingExample
 from blokus.engine.game_state import GameState, ACTION_SPACE_SIZE
 from blokus.mcts.mcts import MCTS
@@ -92,6 +92,10 @@ def apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> None:
         'max_moves':       ('self_play', 'max_moves'),
         'buffer_size':     ('training', 'replay_buffer_size'),
         'value_loss_weight': ('training', 'value_loss_weight'),
+        'value_dropout':     ('training', 'value_dropout'),
+        'score_diff_targets': ('training', 'score_diff_targets'),
+        'score_input':       ('training', 'score_input'),
+        'eval_interval':     ('eval', 'interval'),
     }
     for arg_name, path in overrides.items():
         val = getattr(args, arg_name, None)
@@ -254,15 +258,18 @@ class ReplayBuffer:
 
     _BOARD_SHAPE = (5, 20, 20)
     _PIECES_SHAPE = (84,)
+    _SCORE_SHAPE = (4,)
     _ACTION_SIZE = 67200
 
-    def __init__(self, max_size: int):
+    def __init__(self, max_size: int, store_scores: bool = False):
         self.max_size = max_size
+        self.store_scores = store_scores
         self._size = 0
         # Dense columnar storage — allocated lazily on first add/load
         self._board_states: Optional[np.ndarray] = None
         self._pieces_remaining: Optional[np.ndarray] = None
         self._value_targets: Optional[np.ndarray] = None
+        self._score_vectors: Optional[np.ndarray] = None  # only if store_scores
         # Sparse storage — lists of small arrays, one per example
         self._legal_indices: List[np.ndarray] = []   # each (nnz,) int32
         self._policy_values: List[np.ndarray] = []   # each (nnz,) float32
@@ -273,15 +280,20 @@ class ReplayBuffer:
         old_bs = self._board_states
         old_pr = self._pieces_remaining
         old_vt = self._value_targets
+        old_sv = self._score_vectors
 
         self._board_states = np.empty((new_cap, *self._BOARD_SHAPE), dtype=np.float32)
         self._pieces_remaining = np.empty((new_cap, *self._PIECES_SHAPE), dtype=np.float32)
         self._value_targets = np.empty(new_cap, dtype=np.float32)
+        if self.store_scores:
+            self._score_vectors = np.empty((new_cap, *self._SCORE_SHAPE), dtype=np.float32)
 
         if old_bs is not None and n > 0:
             self._board_states[:n] = old_bs[:n]
             self._pieces_remaining[:n] = old_pr[:n]
             self._value_targets[:n] = old_vt[:n]
+            if self.store_scores and old_sv is not None:
+                self._score_vectors[:n] = old_sv[:n]
 
     def add(self, examples: List[TrainingExample]) -> int:
         """Add examples, dropping oldest if over capacity. Returns count dropped."""
@@ -316,6 +328,8 @@ class ReplayBuffer:
             self._board_states[:keep_old] = self._board_states[src_start:old_size]
             self._pieces_remaining[:keep_old] = self._pieces_remaining[src_start:old_size]
             self._value_targets[:keep_old] = self._value_targets[src_start:old_size]
+            if self.store_scores and self._score_vectors is not None:
+                self._score_vectors[:keep_old] = self._score_vectors[src_start:old_size]
 
         # Add new examples
         dst = keep_old
@@ -324,6 +338,8 @@ class ReplayBuffer:
             self._board_states[dst] = ex.board_state
             self._pieces_remaining[dst] = ex.pieces_remaining
             self._value_targets[dst] = ex.value_target
+            if self.store_scores and ex.score_vector is not None:
+                self._score_vectors[dst] = ex.score_vector
             # Convert dense → sparse
             nonzero = np.nonzero(ex.legal_mask)[0].astype(np.int32)
             self._legal_indices.append(nonzero)
@@ -372,13 +388,18 @@ class ReplayBuffer:
     def get_dense_tensors(self):
         """Return dense columns as CPU tensors (zero-copy via from_numpy).
 
-        Returns (board_states, pieces_vecs, value_targets).
+        Returns (board_states, pieces_vecs, value_targets, score_vectors).
+        score_vectors is None if store_scores is False.
         """
         n = self._size
+        sv = None
+        if self.store_scores and self._score_vectors is not None:
+            sv = torch.from_numpy(self._score_vectors[:n])
         return (
             torch.from_numpy(self._board_states[:n]),
             torch.from_numpy(self._pieces_remaining[:n]),
             torch.from_numpy(self._value_targets[:n]),
+            sv,
         )
 
     def sample(self, n: int) -> List[TrainingExample]:
@@ -445,7 +466,7 @@ class ReplayBuffer:
             start, end = int(offsets[i]), int(offsets[i + 1])
             flat_indices[start:end] = self._legal_indices[i]
             flat_policy[start:end] = self._policy_values[i]
-        return {
+        result = {
             'max_size': self.max_size,
             'size': n,
             'board_states': bs,
@@ -455,6 +476,12 @@ class ReplayBuffer:
             'sparse_indices': flat_indices,
             'sparse_policy': flat_policy,
         }
+        if self.store_scores and self._score_vectors is not None:
+            if n == cap:
+                result['score_vectors'] = self._score_vectors
+            else:
+                result['score_vectors'] = self._score_vectors[:n].copy()
+        return result
 
     def load_state_dict(self, state: dict) -> None:
         """Restore buffer from checkpoint (supports both sparse and legacy dense)."""
@@ -473,6 +500,12 @@ class ReplayBuffer:
         self._board_states[:n] = state['board_states'][:n]
         self._pieces_remaining[:n] = state['pieces_remaining'][:n]
         self._value_targets[:n] = state['value_targets'][:n]
+        if self.store_scores and 'score_vectors' in state:
+            if self._score_vectors is None:
+                from blokus.nn.network import SCORE_VECTOR_SIZE
+                cap = self._board_states.shape[0]
+                self._score_vectors = np.zeros((cap, SCORE_VECTOR_SIZE), dtype=np.float32)
+            self._score_vectors[:n] = state['score_vectors'][:n]
         # Sparse columns
         if 'sparse_offsets' in state:
             offsets = state['sparse_offsets']
@@ -513,6 +546,8 @@ def _self_play_worker(rank: int, model_state_dict: dict, config: dict,
     network = BlokusNetwork(
         num_blocks=config['num_blocks'],
         channels=config['channels'],
+        value_dropout=config.get('value_dropout', 0.0),
+        score_input=config.get('score_input', False),
     ).to(device)
     network.load_state_dict(model_state_dict)
     network.eval()
@@ -526,6 +561,8 @@ def _self_play_worker(rank: int, model_state_dict: dict, config: dict,
         max_moves=config['max_moves'],
         device=device,
         top_k_actions=config.get('top_k_actions', 0),
+        score_diff_targets=config.get('score_diff_targets', False),
+        use_score_input=config.get('score_input', False),
     )
     result_queue.put(examples)
 
@@ -586,6 +623,8 @@ def run_self_play_sequential(network: BlokusNetwork, num_games: int,
             max_moves=cfg['self_play']['max_moves'],
             device=device,
             top_k_actions=cfg['mcts'].get('top_k_actions', 0),
+            score_diff_targets=cfg['training'].get('score_diff_targets', False),
+            use_score_input=cfg['training'].get('score_input', False),
         )
         dt = time.time() - t0
         print(f" {len(examples)} examples in {dt:.1f}s")
@@ -616,7 +655,7 @@ def train_on_examples(network: BlokusNetwork,
     network.train()
 
     # Zero-copy CPU tensors for dense columns
-    board_states, pieces_vecs, value_targets = replay_buffer.get_dense_tensors()
+    board_states, pieces_vecs, value_targets, score_vectors = replay_buffer.get_dense_tensors()
 
     n = len(replay_buffer)
     total_policy_loss = 0.0
@@ -634,6 +673,9 @@ def train_on_examples(network: BlokusNetwork,
             bs = board_states[idx].to(device, non_blocking=True)
             pv = pieces_vecs[idx].to(device, non_blocking=True)
             vt = value_targets[idx].to(device, non_blocking=True)
+            sv = None
+            if score_vectors is not None:
+                sv = score_vectors[idx].to(device, non_blocking=True)
 
             # Sparse → dense reconstruction for this mini-batch
             lm_np, pt_np = replay_buffer.reconstruct_sparse_batch(idx.numpy())
@@ -641,7 +683,7 @@ def train_on_examples(network: BlokusNetwork,
             pt = torch.from_numpy(pt_np).to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            log_policy, value_pred = network(bs, pv, lm)
+            log_policy, value_pred = network(bs, pv, lm, score_vector=sv)
             policy_loss = -torch.sum(pt * log_policy) / bs.size(0)
             value_loss = nn.functional.mse_loss(value_pred, vt)
             loss = policy_loss + value_loss_weight * value_loss
@@ -662,13 +704,16 @@ def train_on_examples(network: BlokusNetwork,
             bs = board_states[i:end].to(device, non_blocking=True)
             pv = pieces_vecs[i:end].to(device, non_blocking=True)
             vt = value_targets[i:end]
+            sv = None
+            if score_vectors is not None:
+                sv = score_vectors[i:end].to(device, non_blocking=True)
 
             # Reconstruct sparse for this batch
             batch_idx = np.arange(i, end)
             lm_np, _ = replay_buffer.reconstruct_sparse_batch(batch_idx)
             lm = torch.from_numpy(lm_np).to(device, non_blocking=True)
 
-            _, value_pred = network(bs, pv, lm)
+            _, value_pred = network(bs, pv, lm, score_vector=sv)
             vp = value_pred.cpu()
 
             mask = vt != 0
@@ -702,8 +747,11 @@ def _eval_select_action_raw(network, state, device, value_preds=None):
     board = torch.from_numpy(state.get_nn_state()).unsqueeze(0).to(device)
     pieces = torch.from_numpy(make_pieces_remaining_vector(state)).unsqueeze(0).to(device)
     mask = torch.from_numpy(state.get_legal_actions_mask()).unsqueeze(0).to(device)
+    sv = None
+    if getattr(network, 'score_input', False):
+        sv = torch.from_numpy(make_score_vector(state)).unsqueeze(0).to(device)
     with torch.no_grad():
-        log_policy, value = network(board, pieces, mask)
+        log_policy, value = network(board, pieces, mask, score_vector=sv)
     if value_preds is not None:
         value_preds.append(value.item())
     probs = torch.exp(log_policy).squeeze(0).cpu().numpy()
@@ -868,6 +916,10 @@ def main():
     parser.add_argument('--max-moves', type=int, default=None, dest='max_moves')
     parser.add_argument('--buffer-size', type=int, default=None, dest='buffer_size')
     parser.add_argument('--value-loss-weight', type=float, default=None, dest='value_loss_weight')
+    parser.add_argument('--value-dropout', type=float, default=None, dest='value_dropout')
+    parser.add_argument('--score-diff-targets', action='store_true', default=None, dest='score_diff_targets')
+    parser.add_argument('--score-input', action='store_true', default=None, dest='score_input')
+    parser.add_argument('--eval-interval', type=int, default=None, dest='eval_interval')
     args = parser.parse_args()
 
     # Load config
@@ -887,10 +939,17 @@ def main():
         device = torch.device(device_str)
     print(f"Using device: {device}")
 
+    # Read experimental flags
+    value_dropout = cfg['training'].get('value_dropout', 0.0) or 0.0
+    score_diff_targets = cfg['training'].get('score_diff_targets', False) or False
+    score_input = cfg['training'].get('score_input', False) or False
+
     # Create network
     network = BlokusNetwork(
         num_blocks=cfg['network']['num_blocks'],
         channels=cfg['network']['channels'],
+        value_dropout=value_dropout,
+        score_input=score_input,
     ).to(device)
 
     param_count = sum(p.numel() for p in network.parameters())
@@ -912,7 +971,7 @@ def main():
 
     # Replay buffer
     buffer_size = cfg['training'].get('replay_buffer_size', 30000)
-    replay_buffer = ReplayBuffer(max_size=buffer_size)
+    replay_buffer = ReplayBuffer(max_size=buffer_size, store_scores=score_input)
     print(f"Replay buffer: capacity {buffer_size}")
 
     start_iteration = 1
@@ -928,7 +987,16 @@ def main():
             ckpt = ckpt_mgr.load(args.resume, device)
 
         if ckpt:
-            network.load_state_dict(ckpt['model_state_dict'])
+            # Handle mismatched FC layer sizes (e.g. resuming non-score-input
+            # checkpoint into score-input network)
+            try:
+                network.load_state_dict(ckpt['model_state_dict'])
+            except RuntimeError as e:
+                if 'size mismatch' in str(e):
+                    print(f"  WARNING: Model size mismatch — loading with strict=False")
+                    network.load_state_dict(ckpt['model_state_dict'], strict=False)
+                else:
+                    raise
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
             start_iteration = ckpt.get('iteration', 0) + 1
             cumulative_games = ckpt.get('cumulative_games', 0)
@@ -995,6 +1063,9 @@ def main():
         'num_blocks': cfg['network']['num_blocks'],
         'channels': cfg['network']['channels'],
         'top_k_actions': cfg['mcts'].get('top_k_actions', 0),
+        'value_dropout': value_dropout,
+        'score_diff_targets': score_diff_targets,
+        'score_input': score_input,
     }
 
     num_workers = cfg['self_play']['num_workers']

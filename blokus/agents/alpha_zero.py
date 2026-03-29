@@ -10,7 +10,9 @@ from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
 from blokus.engine.game_state import GameState, ACTION_SPACE_SIZE
-from blokus.nn.network import BlokusNetwork, make_pieces_remaining_vector
+from blokus.nn.network import (
+    BlokusNetwork, make_pieces_remaining_vector, make_score_vector,
+)
 from blokus.mcts.mcts import MCTS
 
 
@@ -24,12 +26,14 @@ class TrainingExample:
         legal_mask: (67200,) float32 binary mask.
         policy_target: (67200,) float32 MCTS visit count distribution.
         value_target: float in [-1, 1] — game outcome from this player's perspective.
+        score_vector: (4,) float32 normalized scores (optional, for score_input).
     """
     board_state: np.ndarray
     pieces_remaining: np.ndarray
     legal_mask: np.ndarray
     policy_target: np.ndarray
     value_target: float
+    score_vector: Optional[np.ndarray] = None
 
 
 class AlphaZeroAgent:
@@ -93,6 +97,8 @@ def self_play_game(network: BlokusNetwork,
                    max_moves: int = 0,
                    device: Optional[torch.device] = None,
                    top_k_actions: int = 0,
+                   score_diff_targets: bool = False,
+                   use_score_input: bool = False,
                    ) -> List[TrainingExample]:
     """Play a complete self-play game and collect training examples.
 
@@ -107,6 +113,8 @@ def self_play_game(network: BlokusNetwork,
         temp_threshold: After this many moves, switch to greedy play.
         max_moves: Stop after this many moves (0 = play to completion).
         device: PyTorch device.
+        score_diff_targets: Use normalized score differential as value target.
+        use_score_input: Record score vectors for score-input value head.
 
     Returns:
         List of TrainingExample objects for training.
@@ -123,8 +131,8 @@ def self_play_game(network: BlokusNetwork,
 
     state = GameState.new_game(game_mode)
 
-    # Collect (state_data, policy, agent_idx) during play
-    game_history: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]] = []
+    # Collect (state_data, policy, agent_idx, score_vec) during play
+    game_history: List[Tuple] = []
     move_count = 0
 
     while not state.is_terminal():
@@ -146,30 +154,45 @@ def self_play_game(network: BlokusNetwork,
         pieces_vec = make_pieces_remaining_vector(state)
         legal_mask = state.get_legal_actions_mask()
         current_agent = state.get_current_agent()
+        score_vec = make_score_vector(state) if use_score_input else None
 
         # MCTS action selection
         action, policy = agent.select_action(state)
 
         game_history.append((
-            board_state, pieces_vec, legal_mask, policy, current_agent
+            board_state, pieces_vec, legal_mask, policy, current_agent, score_vec
         ))
 
         state = state.apply_action(action)
         move_count += 1
 
-    # Game over: get final rewards
-    rewards = state.get_rewards()
+    # Game over: compute value targets
+    scores = state.get_scores()
 
-    # Build training examples with actual game outcome as value target
+    if score_diff_targets:
+        # Normalized score differential per agent
+        if game_mode == 'dual':
+            s0 = scores[0] + scores[2]
+            s1 = scores[1] + scores[3]
+        else:
+            s0 = scores.get(0, 0)
+            s1 = sum(scores.get(i, 0) for i in range(1, 4))
+        total = max(s0 + s1, 1)
+        agent_values = {0: (s0 - s1) / total, 1: (s1 - s0) / total}
+    else:
+        agent_values = state.get_rewards()
+
+    # Build training examples
     examples: List[TrainingExample] = []
-    for board_state, pieces_vec, legal_mask, policy, agent_idx in game_history:
-        value_target = rewards.get(agent_idx, 0.0)
+    for board_state, pieces_vec, legal_mask, policy, agent_idx, score_vec in game_history:
+        value_target = agent_values.get(agent_idx, 0.0)
         examples.append(TrainingExample(
             board_state=board_state,
             pieces_remaining=pieces_vec,
             legal_mask=legal_mask,
             policy_target=policy,
             value_target=value_target,
+            score_vector=score_vec,
         ))
 
     return examples
