@@ -1000,9 +1000,10 @@ def main():
                 for k, old_s, new_s in mismatched:
                     print(f"  WARNING: Skipping {k}: checkpoint {old_s} != model {new_s}")
                 network.load_state_dict(ckpt_sd, strict=False)
+                print("  WARNING: Skipping optimizer state (model shape changed)")
             else:
                 network.load_state_dict(ckpt_sd)
-            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
             start_iteration = ckpt.get('iteration', 0) + 1
             cumulative_games = ckpt.get('cumulative_games', 0)
             cumulative_examples = ckpt.get('cumulative_examples', 0)
