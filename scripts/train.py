@@ -978,6 +978,11 @@ def main():
     cumulative_games = 0
     cumulative_examples = 0
     loss_history: List[Dict[str, float]] = []
+    # W&B run id read from checkpoint when resuming. Used to reattach to the
+    # original W&B run instead of forking a new one. None on fresh start, on
+    # legacy checkpoints (predating this field), or when W&B was disabled in
+    # the resumed run.
+    resumed_wandb_run_id: Optional[str] = None
 
     # Resume
     if args.resume:
@@ -1008,6 +1013,10 @@ def main():
             cumulative_games = ckpt.get('cumulative_games', 0)
             cumulative_examples = ckpt.get('cumulative_examples', 0)
             loss_history = ckpt.get('loss_history', [])
+            # Pick up the W&B run id (if any) so we can reattach below.
+            # Older checkpoints predate this field — `.get` falls back to None
+            # and we'll start a fresh W&B run with a warning.
+            resumed_wandb_run_id = ckpt.get('wandb_run_id', None)
             # Restore replay buffer — check npz first, then legacy .pt, then inline
             buf_npz = os.path.join(cfg['checkpoint']['dir'], 'replay_buffer.npz')
             buf_pt = os.path.join(cfg['checkpoint']['dir'], 'replay_buffer.pt')
@@ -1047,12 +1056,27 @@ def main():
     if cfg['wandb']['enabled']:
         try:
             import wandb
-            wandb_run = wandb.init(
+            # If we're resuming and the prior checkpoint stored a W&B run id,
+            # reattach to that run so the dashboard shows one contiguous
+            # training trajectory. Otherwise let W&B mint a fresh id.
+            init_kwargs = dict(
                 project=cfg['wandb']['project'],
                 name=cfg['wandb']['run_name'],
                 config=cfg,
                 resume='allow',
             )
+            if resumed_wandb_run_id:
+                init_kwargs['id'] = resumed_wandb_run_id
+                print(f"W&B: reattaching to prior run id {resumed_wandb_run_id}")
+            elif args.resume:
+                # Resumed from a checkpoint that predates the wandb_run_id
+                # field (or where W&B was disabled). Inform the user that a
+                # new W&B run will be created — this is the legacy behavior.
+                print("WARNING: resumed checkpoint has no wandb_run_id — "
+                      "starting a fresh W&B run (history will fork in W&B). "
+                      "Future resumes from checkpoints written by this run "
+                      "will reattach correctly.")
+            wandb_run = wandb.init(**init_kwargs)
             print(f"W&B run: {wandb_run.url}")
         except ImportError:
             print("WARNING: wandb not installed, logging disabled")
@@ -1206,12 +1230,17 @@ def main():
               f"({train_time:.1f}s)")
 
         # ------ Checkpoint ------
+        # Persist the active W&B run id so future resumes (--resume) can
+        # reattach to the same dashboard run via wandb.init(id=..., resume="allow").
+        # None when W&B is disabled — that's fine, resume will print a warning
+        # and start a fresh run.
         meta = {
             'cumulative_games': cumulative_games,
             'cumulative_examples': cumulative_examples,
             'loss_history': loss_history,
             'stats': stats,
             'replay_buffer': replay_buffer.state_dict(),
+            'wandb_run_id': wandb_run.id if wandb_run else None,
         }
         ckpt_path = ckpt_mgr.save(iteration, network, optimizer, meta, cfg)
         if ckpt_path:

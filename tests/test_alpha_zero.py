@@ -486,6 +486,85 @@ class TestReplayBuffer:
             assert rec.value_target == orig.value_target
 
 
+class TestCheckpointManager:
+    """Tests for CheckpointManager — focused on metadata round-tripping."""
+
+    @pytest.fixture
+    def train_module(self):
+        import sys, os
+        sys.path.insert(0, os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'scripts',
+        ))
+        import train
+        return train
+
+    @pytest.fixture
+    def tiny_net_and_opt(self):
+        """A trivially small model + optimizer pair, enough for checkpoint I/O."""
+        net = torch.nn.Linear(4, 4)
+        opt = torch.optim.SGD(net.parameters(), lr=0.01)
+        return net, opt
+
+    def test_wandb_run_id_round_trips(self, train_module, tiny_net_and_opt, tmp_path):
+        """CheckpointManager preserves arbitrary meta fields, including wandb_run_id.
+
+        This is the contract behind the W&B run-continuity feature: on resume
+        the train script reads `wandb_run_id` from the checkpoint and reattaches
+        to the original W&B run via wandb.init(id=..., resume="allow").
+        """
+        net, opt = tiny_net_and_opt
+        ckpt_mgr = train_module.CheckpointManager(
+            save_dir=str(tmp_path), save_every=1, keep_top_k=3,
+        )
+
+        meta = {
+            'cumulative_games': 100,
+            'cumulative_examples': 6000,
+            'loss_history': [{'iteration': 1, 'policy_loss': 4.0}],
+            'stats': {'policy_loss': 4.0},
+            'wandb_run_id': 'abc123xyz',
+        }
+        ckpt_mgr.save(iteration=1, network=net, optimizer=opt,
+                      meta=meta, cfg={'dummy': True})
+
+        # Latest checkpoint is the canonical resume target
+        loaded = ckpt_mgr.load_latest(device=torch.device('cpu'))
+        assert loaded is not None
+        assert loaded['wandb_run_id'] == 'abc123xyz'
+        assert loaded['cumulative_games'] == 100
+        assert loaded['iteration'] == 1
+
+    def test_legacy_checkpoint_has_no_wandb_run_id(self, train_module,
+                                                    tiny_net_and_opt, tmp_path):
+        """Checkpoints written without `wandb_run_id` in meta load cleanly.
+
+        Resume code uses ckpt.get('wandb_run_id', None) and falls back to
+        starting a fresh W&B run with a printed warning. This test pins down
+        that legacy checkpoints (no wandb_run_id key at all) are handled.
+        """
+        net, opt = tiny_net_and_opt
+        ckpt_mgr = train_module.CheckpointManager(
+            save_dir=str(tmp_path), save_every=1, keep_top_k=3,
+        )
+
+        # Legacy meta — no wandb_run_id field
+        meta = {
+            'cumulative_games': 0,
+            'cumulative_examples': 0,
+            'loss_history': [],
+            'stats': {'policy_loss': 5.0},
+        }
+        ckpt_mgr.save(iteration=1, network=net, optimizer=opt,
+                      meta=meta, cfg={})
+
+        loaded = ckpt_mgr.load_latest(device=torch.device('cpu'))
+        assert loaded is not None
+        assert 'wandb_run_id' not in loaded
+        # The resume code path uses .get(...) so this is the fallback shape:
+        assert loaded.get('wandb_run_id', None) is None
+
+
 class TestTraining:
     """Tests for the training loop."""
 
