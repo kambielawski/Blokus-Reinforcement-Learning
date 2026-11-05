@@ -46,6 +46,10 @@ NUM_PIECES = 21
 MAX_ORIENTATIONS = 8
 NUM_COLORS = 4
 
+# Bumped when the meaning of an action index changes. Version 2 normalized four
+# orientations of pieces 18-20 to (0, 0); see BlokusNetwork.legacy_action_encoding.
+ACTION_ENCODING_VERSION = 2
+
 # Total action space: piece_id * (8 * 20 * 20) + ori_id * (20 * 20) + row * 20 + col
 ACTION_SPACE_SIZE = NUM_PIECES * MAX_ORIENTATIONS * BOARD_SIZE * BOARD_SIZE  # 67,200
 
@@ -124,7 +128,12 @@ def load_pieces(pickle_path: Optional[str] = None) -> List[PieceInfo]:
             orientations: List[OrientationData] = []
             num_cells = 0
             for (p, _is_flipped, _rot) in raw_orientations:
-                occupied = tuple(sorted(p.occupied))
+                # Piece.shift_min() only corrects negative coordinates, so some
+                # orientations arrive offset from (0, 0). Without normalizing,
+                # those placements can never reach row 0 or column 0.
+                min_row = min(r for r, c in p.occupied)
+                min_col = min(c for r, c in p.occupied)
+                occupied = tuple(sorted((r - min_row, c - min_col) for r, c in p.occupied))
                 num_cells = len(occupied)
                 max_row = max(r for r, c in occupied)
                 max_col = max(c for r, c in occupied)

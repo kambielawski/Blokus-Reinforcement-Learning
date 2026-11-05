@@ -38,7 +38,7 @@ sys.path.insert(0, REPO_ROOT)
 
 from blokus.nn.network import BlokusNetwork, make_pieces_remaining_vector, make_score_vector
 from blokus.agents.alpha_zero import self_play_game, TrainingExample
-from blokus.engine.game_state import GameState, ACTION_SPACE_SIZE
+from blokus.engine.game_state import GameState, ACTION_SPACE_SIZE, ACTION_ENCODING_VERSION
 from blokus.mcts.mcts import MCTS
 
 
@@ -146,6 +146,7 @@ class CheckpointManager:
             'model_state_dict': network.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'config': cfg,
+            'action_encoding': ACTION_ENCODING_VERSION,
             **meta,
         }
 
@@ -219,6 +220,7 @@ class CheckpointManager:
                 'model_state_dict': network.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'config': cfg,
+                'action_encoding': ACTION_ENCODING_VERSION,
                 **meta_clean,
             }
             torch.save(payload, best_ckpt_path)

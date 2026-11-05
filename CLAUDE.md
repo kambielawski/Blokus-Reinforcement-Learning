@@ -323,6 +323,35 @@ TRAIN_ARGS="--iterations 200 --sims 200 --num-workers 8" sbatch slurm/train_alph
 
 Checkpoints saved to `data/checkpoints/` (gitignored).
 
+## Playing the AI
+
+```bash
+python scripts/play.py    # opens http://127.0.0.1:8765/ in the browser
+```
+
+Dual-color 1v1. `blokus/ui/server.py` is a stdlib-only HTTP server on loopback,
+`blokus/ui/session.py` owns one game (rules, automatic passes, AI thread), and
+`blokus/ui/static/index.html` is the whole front end. Each game is rewritten to
+`data/human_games/<timestamp>-<id>.json` after every ply, including the checkpoint
+hash, search settings, each move's cells and timing, and the AI's top moves. Replaying
+`moves[].action` through `GameState` reproduces the game.
+
+## Evaluation
+
+`scripts/ladder.py` plays matchups with paired openings and swapped seats, and
+reports win rate with Wilson 95% CIs and score margin. Results append to
+`<out>/games.jsonl`, so a stopped run resumes. Bots are in `blokus/agents/bots.py`
+(`random`, `size`, `space1`, `space2`, `mobility`); `blokus/nn/checkpoint.py` loads any
+checkpoint. Win rate against random says almost nothing: see the mobility results in
+the project progress log.
+
+### Action encoding versions
+
+Action indices changed meaning once. Version 2 normalized four orientations of pieces
+18-20 to (0, 0), making 91 previously unreachable placements legal. New checkpoints
+record `action_encoding: 2`. Older ones load with `legacy_action_encoding=True`, which
+shifts those policy channels. Do not reuse a pre-v2 replay buffer in training.
+
 ## Development Roadmap
 
 | Phase | Description | Status |
@@ -331,4 +360,4 @@ Checkpoints saved to `data/checkpoints/` (gitignored).
 | **2. Neural Network** | ResNet with convolutional policy + value heads | **Done** |
 | **3. MCTS** | PUCT-based tree search with NN-guided evaluation | **Done** |
 | **4. Self-Play** | Data generation loop + training pipeline | **Done** |
-| **5. Interactive** | Human vs agent play mode | Planned |
+| **5. Interactive** | Human vs agent play mode (dual) | **Done** (`scripts/play.py`) |

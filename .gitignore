@@ -14,3 +14,8 @@ data/checkpoints/
 blokus/engine/_legal_moves.c
 *.so
 build/
+
+# Local copies of remote checkpoints, human game records, ladder results
+data/vacc/
+data/human_games/
+data/ladder/

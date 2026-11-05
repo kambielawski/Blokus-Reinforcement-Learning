@@ -1,0 +1,620 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blokus vs AI</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  --bg: #f4f2ee; --panel: #ffffff; --ink: #24262b; --muted: #6b6f78; --line: #d9d6cf;
+  --cell: #ece9e2; --cell-line: #cfcbc2; --ok: #1a8f4c; --bad: #d43131; --accent: #2b59c3;
+  --c0: #eab308; --c1: #2563eb; --c2: #dc2626; --c3: #16a34a;
+  --size: min(calc((100vh - 48px) / 20), calc((100vw - 620px) / 20), 36px);
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #17181c; --panel: #212329; --ink: #e9e9ec; --muted: #9a9ea8; --line: #363943;
+    --cell: #2b2d34; --cell-line: #3b3e47; --ok: #3ccf7c; --bad: #ff6b6b; --accent: #7ea2ff;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+#app { display: grid; grid-template-columns: 270px auto 310px; gap: 14px; padding: 14px;
+  justify-content: center; align-items: start; min-height: 100vh; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+  margin: 0 0 8px; font-weight: 600; }
+button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+  padding: 6px 10px; border-radius: 7px; cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+kbd { font: 11px ui-monospace, Menlo, monospace; border: 1px solid var(--line); border-radius: 4px;
+  padding: 0 4px; color: var(--muted); }
+
+#board { display: grid; grid-template-columns: repeat(20, var(--size)); grid-auto-rows: var(--size);
+  background: var(--cell-line); gap: 1px; border: 2px solid var(--cell-line); border-radius: 6px;
+  width: max-content; user-select: none; position: relative; }
+.cell { background: var(--cell); position: relative; }
+.cell.c0 { background: var(--c0); } .cell.c1 { background: var(--c1); }
+.cell.c2 { background: var(--c2); } .cell.c3 { background: var(--c3); }
+.cell.last { box-shadow: inset 0 0 0 2px rgba(255,255,255,.85), inset 0 0 0 3px rgba(0,0,0,.5); }
+.cell.legal::after { content: ""; position: absolute; inset: 0; background: var(--active); opacity: .2; }
+.cell.anchor::before { content: ""; position: absolute; inset: 34%; border-radius: 50%;
+  background: var(--active); opacity: .8; }
+.cell.start { box-shadow: inset 0 0 0 2px var(--corner); }
+.cell.pv { z-index: 2; }
+.cell.pv-ok { background: var(--active) !important; outline: 2px solid var(--ok); outline-offset: -2px; }
+.cell.pv-bad { background: var(--bad) !important; opacity: .65; }
+#board.shake { animation: shake .3s; }
+@keyframes shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+
+#tray { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; }
+.tile { aspect-ratio: 1; border: 1px solid var(--line); border-radius: 6px; display: flex;
+  align-items: center; justify-content: center; cursor: pointer; background: transparent; padding: 3px; }
+.tile.selected { border: 2px solid var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.tile.unavailable { opacity: .28; }
+.tile.used { visibility: hidden; }
+.tile:disabled { cursor: default; }
+.shape { display: grid; gap: 1px; }
+.shape i { display: block; background: var(--shape); border-radius: 1px; }
+.shape i.off { background: transparent; }
+
+#controls { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
+#hint { margin-top: 8px; color: var(--muted); font-size: 12px; min-height: 34px; }
+#status { font-size: 16px; font-weight: 600; display: flex; align-items: center; gap: 8px; min-height: 26px; }
+#status .dot { width: 14px; height: 14px; border-radius: 3px; flex: none; }
+#message { margin-top: 6px; font-size: 13px; min-height: 20px; color: var(--muted); }
+#message.error { color: var(--bad); font-weight: 600; }
+
+.totals { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+.total { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+.total b { display: block; font-size: 26px; line-height: 1.15; font-variant-numeric: tabular-nums; }
+.total span { color: var(--muted); font-size: 12px; }
+.total.mover { border-color: var(--accent); }
+.colorrow { padding: 6px 0; border-top: 1px solid var(--line); }
+.colorrow header { display: flex; align-items: center; gap: 6px; font-size: 13px; margin-bottom: 4px; }
+.colorrow header .dot { width: 11px; height: 11px; border-radius: 3px; }
+.colorrow header span.num { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+.mini { display: flex; flex-wrap: wrap; gap: 4px; }
+#log { max-height: 190px; overflow-y: auto; font-size: 12px; margin: 0; padding: 0; list-style: none;
+  font-variant-numeric: tabular-nums; }
+#log li { padding: 2px 0; display: flex; gap: 6px; align-items: baseline; }
+#log .dot { width: 8px; height: 8px; border-radius: 2px; flex: none; align-self: center; }
+#log .dim { color: var(--muted); margin-left: auto; }
+
+#banner { margin-top: 10px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); display: none; }
+#banner.show { display: block; }
+#banner strong { font-size: 18px; display: block; }
+#banner code { font: 11px ui-monospace, Menlo, monospace; word-break: break-all; color: var(--muted); }
+
+dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--ink);
+  padding: 20px; width: 440px; max-width: calc(100vw - 32px); }
+dialog::backdrop { background: rgba(0,0,0,.45); }
+dialog h1 { font-size: 19px; margin: 0 0 12px; }
+dialog label { display: block; margin: 10px 0 3px; font-size: 13px; color: var(--muted); }
+dialog select, dialog input[type=number] { width: 100%; padding: 6px 8px; font: inherit; color: var(--ink);
+  background: var(--bg); border: 1px solid var(--line); border-radius: 7px; }
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.sidepick { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.sidepick button { padding: 10px; text-align: left; }
+.sidepick button.on { border: 2px solid var(--accent); padding: 9px; }
+.swatches { display: inline-flex; gap: 3px; margin-right: 6px; vertical-align: -1px; }
+.swatches i { width: 12px; height: 12px; border-radius: 3px; display: block; }
+.note { font-size: 12px; color: var(--muted); margin: 6px 0 0; }
+dialog footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+
+@media (max-width: 1000px) {
+  :root { --size: min(calc((100vw - 32px) / 20), 34px); }
+  #app { grid-template-columns: 1fr; justify-items: center; }
+  #left, #right { width: 100%; max-width: calc(var(--size) * 20 + 40px); }
+  #centre { order: -1; }
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="left">
+    <div class="panel">
+      <h2 id="trayTitle">Your pieces</h2>
+      <div id="tray"></div>
+      <div id="controls">
+        <button id="rotate" title="Rotate (R)">Rotate <kbd>R</kbd></button>
+        <button id="flip" title="Flip (F)">Flip <kbd>F</kbd></button>
+        <button id="deselect" title="Put down (Esc)">Clear <kbd>Esc</kbd></button>
+      </div>
+      <div id="hint"></div>
+    </div>
+  </div>
+
+  <div id="centre"><div id="board"></div></div>
+
+  <div id="right">
+    <div class="panel">
+      <div id="status"></div>
+      <div id="message"></div>
+      <div id="banner"></div>
+    </div>
+    <div class="panel" style="margin-top:10px">
+      <div class="totals" id="totals"></div>
+      <div id="colors"></div>
+    </div>
+    <div class="panel" style="margin-top:10px">
+      <h2>Moves</h2>
+      <ul id="log"></ul>
+    </div>
+    <div style="margin-top:10px"><button id="newgame">New game</button></div>
+  </div>
+</div>
+
+<dialog id="dialog">
+  <h1>New game</h1>
+  <label>Play as</label>
+  <div class="sidepick">
+    <button type="button" data-side="0"><span class="swatches"><i style="background:var(--c0)"></i><i style="background:var(--c2)"></i></span>Yellow + Red<br><small>Moves first, top corners</small></button>
+    <button type="button" data-side="1"><span class="swatches"><i style="background:var(--c1)"></i><i style="background:var(--c3)"></i></span>Blue + Green<br><small>Moves second, bottom corners</small></button>
+  </div>
+  <div class="row2">
+    <div><label for="sims">AI simulations per move</label><input id="sims" type="number" min="1" step="50"></div>
+    <div><label for="think">AI seconds per move (0 = no limit)</label><input id="think" type="number" min="0" step="1"></div>
+  </div>
+  <p class="note" id="speedNote"></p>
+  <p class="note">Score is squares placed, with no bonus for playing every piece. The game ends when no color can move, or as soon as any color has played all 21 pieces.</p>
+  <label for="checkpoint">Model</label>
+  <select id="checkpoint"></select>
+  <footer>
+    <button type="button" id="cancelNew">Cancel</button>
+    <button type="button" class="primary" id="startNew">Start</button>
+  </footer>
+</dialog>
+
+<script>
+const COLOR_VAR = ['var(--c0)', 'var(--c1)', 'var(--c2)', 'var(--c3)'];
+let meta = null, state = null;
+let selection = null;            // {piece, orientation}
+let orientationMemory = {};      // Last orientation used per piece
+let legalSet = new Set();        // "p,o,r,c"
+let legalByShape = new Map();    // "p,o" -> [[r, c], ...]
+let hoverCell = null, preview = null;
+let pollTimer = null, chosenSide = 0, messageTimer = null;
+let cells = [];
+let lastBoardKey = '';
+
+const $ = id => document.getElementById(id);
+
+async function api(path, body) {
+  const res = await fetch(path, body === undefined ? {} : {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+  });
+  return {ok: res.ok, data: await res.json()};
+}
+
+function shapeEl(shape, size) {
+  const rows = Math.max(...shape.map(s => s[0])) + 1;
+  const cols = Math.max(...shape.map(s => s[1])) + 1;
+  const grid = document.createElement('div');
+  grid.className = 'shape';
+  grid.style.gridTemplateColumns = `repeat(${cols}, ${size}px)`;
+  grid.style.gridAutoRows = `${size}px`;
+  const filled = new Set(shape.map(s => `${s[0]},${s[1]}`));
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    const i = document.createElement('i');
+    if (!filled.has(`${r},${c}`)) i.className = 'off';
+    grid.append(i);
+  }
+  return grid;
+}
+
+function buildBoard() {
+  const board = $('board');
+  board.innerHTML = '';
+  cells = [];
+  for (let r = 0; r < 20; r++) {
+    const row = [];
+    for (let c = 0; c < 20; c++) {
+      const el = document.createElement('div');
+      el.className = 'cell';
+      el.dataset.r = r;
+      el.dataset.c = c;
+      board.append(el);
+      row.push(el);
+    }
+    cells.push(row);
+  }
+  board.addEventListener('mouseover', e => {
+    if (e.target.dataset.r === undefined) return;
+    hoverCell = [+e.target.dataset.r, +e.target.dataset.c];
+    drawPreview();
+  });
+  board.addEventListener('mouseleave', () => { hoverCell = null; drawPreview(); });
+  board.addEventListener('click', onBoardClick);
+  board.addEventListener('wheel', e => {
+    if (!selection) return;
+    e.preventDefault();
+    rotate();
+  }, {passive: false});
+}
+
+function currentShape() {
+  return meta.pieces[selection.piece].orientations[selection.orientation];
+}
+
+// The cell of the piece that sits under the cursor: the one closest to its center.
+function handleOf(shape) {
+  const mr = shape.reduce((a, s) => a + s[0], 0) / shape.length;
+  const mc = shape.reduce((a, s) => a + s[1], 0) / shape.length;
+  let best = shape[0], bestD = Infinity;
+  for (const s of shape) {
+    const d = (s[0] - mr) ** 2 + (s[1] - mc) ** 2;
+    if (d < bestD) { bestD = d; best = s; }
+  }
+  return best;
+}
+
+// Where a click would place the piece. Stays at the cursor when that is legal,
+// otherwise snaps to the nearest legal placement still covering the hovered cell.
+function computePreview() {
+  if (!selection || !hoverCell || !state || !state.your_turn) return null;
+  const shape = currentShape();
+  const h = handleOf(shape);
+  const row = hoverCell[0] - h[0], col = hoverCell[1] - h[1];
+  const key = `${selection.piece},${selection.orientation}`;
+  if (legalSet.has(`${key},${row},${col}`)) return {row, col, legal: true};
+  let best = null, bestD = Infinity;
+  for (const [r, c] of legalByShape.get(key) || []) {
+    const covers = shape.some(s => s[0] + r === hoverCell[0] && s[1] + c === hoverCell[1]);
+    if (!covers) continue;
+    const d = (r - row) ** 2 + (c - col) ** 2;
+    if (d < bestD) { bestD = d; best = {row: r, col: c, legal: true}; }
+  }
+  return best || {row, col, legal: false};
+}
+
+function drawPreview() {
+  for (const el of document.querySelectorAll('.cell.pv')) el.classList.remove('pv', 'pv-ok', 'pv-bad');
+  preview = computePreview();
+  if (!preview) return;
+  for (const s of currentShape()) {
+    const r = s[0] + preview.row, c = s[1] + preview.col;
+    if (r >= 0 && r < 20 && c >= 0 && c < 20) {
+      cells[r][c].classList.add('pv', preview.legal ? 'pv-ok' : 'pv-bad');
+    }
+  }
+}
+
+function drawLegal() {
+  for (const row of cells) for (const el of row) el.classList.remove('legal', 'anchor');
+  if (!state || !state.your_turn) return;
+  if (selection) {
+    for (const [r, c] of legalByShape.get(`${selection.piece},${selection.orientation}`) || []) {
+      for (const s of currentShape()) cells[s[0] + r][s[1] + c].classList.add('legal');
+    }
+  }
+  // Dots mark the cells a new piece can grow from
+  const own = state.current_color + 1;
+  const b = state.board;
+  const at = (r, c) => (r >= 0 && r < 20 && c >= 0 && c < 20) ? b[r][c] : -1;
+  const playedAny = b.some(row => row.includes(own));
+  if (!playedAny) {
+    const [r, c] = meta.corners[state.current_color];
+    cells[r][c].classList.add('anchor');
+    return;
+  }
+  for (let r = 0; r < 20; r++) for (let c = 0; c < 20; c++) {
+    if (b[r][c] !== 0) continue;
+    const edge = [at(r-1,c), at(r+1,c), at(r,c-1), at(r,c+1)].includes(own);
+    const corner = [at(r-1,c-1), at(r-1,c+1), at(r+1,c-1), at(r+1,c+1)].includes(own);
+    if (corner && !edge) cells[r][c].classList.add('anchor');
+  }
+}
+
+function drawBoard() {
+  const lastCells = new Set();
+  // Highlight everything played since the human's previous move
+  for (let i = state.moves.length - 1; i >= 0; i--) {
+    const m = state.moves[i];
+    if (m.actor === 'human' && m.type === 'place' && i < state.moves.length - 1) break;
+    if (m.type === 'place') for (const [r, c] of m.cells) lastCells.add(`${r},${c}`);
+    if (m.actor === 'human' && m.type === 'place') break;
+  }
+  const corners = new Map(meta.corners.map((p, i) => [`${p[0]},${p[1]}`, i]));
+  for (let r = 0; r < 20; r++) for (let c = 0; c < 20; c++) {
+    const v = state.board[r][c];
+    const el = cells[r][c];
+    el.classList.remove('c0', 'c1', 'c2', 'c3', 'last', 'start');
+    el.style.removeProperty('--corner');
+    if (v > 0) {
+      el.classList.add(`c${v - 1}`);
+      if (lastCells.has(`${r},${c}`)) el.classList.add('last');
+    } else if (corners.has(`${r},${c}`)) {
+      el.classList.add('start');
+      el.style.setProperty('--corner', COLOR_VAR[corners.get(`${r},${c}`)]);
+    }
+  }
+  document.documentElement.style.setProperty('--active', COLOR_VAR[state.current_color]);
+}
+
+// The color whose pieces the tray shows: the one moving, or the human's next color.
+function trayColor() {
+  if (state.your_turn) return state.current_color;
+  let color = state.current_color;
+  while (color % 2 !== state.human_agent) color = (color + 1) % 4;
+  return color;
+}
+
+function drawTray() {
+  const color = trayColor();
+  $('trayTitle').textContent = `${meta.color_names[color]} pieces`;
+  const tray = $('tray');
+  tray.innerHTML = '';
+  tray.style.setProperty('--shape', COLOR_VAR[color]);
+  const remaining = new Set(state.pieces_remaining[color]);
+  const placeable = new Set();
+  for (const key of legalByShape.keys()) placeable.add(+key.split(',')[0]);
+  const order = [...meta.pieces].sort((a, b) => b.size - a.size || a.id - b.id);
+  for (const piece of order) {
+    const tile = document.createElement('button');
+    tile.className = 'tile';
+    tile.dataset.piece = piece.id;
+    tile.title = piece.name;
+    const orientation = orientationMemory[piece.id] || 0;
+    tile.append(shapeEl(piece.orientations[orientation], 9));
+    if (!remaining.has(piece.id)) tile.classList.add('used');
+    if (state.your_turn && !placeable.has(piece.id)) {
+      tile.classList.add('unavailable');
+      tile.title += ' (no legal placement right now)';
+    }
+    if (selection && selection.piece === piece.id) tile.classList.add('selected');
+    tile.disabled = !state.your_turn;
+    tile.addEventListener('click', () => selectPiece(piece.id));
+    tray.append(tile);
+  }
+  $('rotate').disabled = $('flip').disabled = $('deselect').disabled = !selection;
+  drawHint();
+}
+
+function drawHint() {
+  if (!state.your_turn) { $('hint').textContent = ''; return; }
+  if (!selection) { $('hint').textContent = 'Pick a piece. Dots mark where a new piece can grow from.'; return; }
+  const n = (legalByShape.get(`${selection.piece},${selection.orientation}`) || []).length;
+  const name = meta.pieces[selection.piece].name;
+  $('hint').textContent = n
+    ? `${name}: ${n} legal placement${n === 1 ? '' : 's'} in this orientation. Scroll over the board to rotate.`
+    : `${name}: no legal placement in this orientation. Try rotating or flipping.`;
+}
+
+function selectPiece(id) {
+  if (!state.your_turn) return;
+  if (!state.pieces_remaining[state.current_color].includes(id)) return;
+  selection = {piece: id, orientation: orientationMemory[id] || 0};
+  redrawSelection();
+}
+
+function rotate() {
+  if (!selection) return;
+  selection.orientation = meta.pieces[selection.piece].rotate[selection.orientation];
+  orientationMemory[selection.piece] = selection.orientation;
+  redrawSelection();
+}
+
+function flip() {
+  if (!selection) return;
+  selection.orientation = meta.pieces[selection.piece].flip[selection.orientation];
+  orientationMemory[selection.piece] = selection.orientation;
+  redrawSelection();
+}
+
+function redrawSelection() {
+  drawTray();
+  drawLegal();
+  drawPreview();
+}
+
+async function onBoardClick() {
+  if (!selection || !preview || !state.your_turn) return;
+  const {ok, data} = await api('/api/move', {
+    piece: selection.piece, orientation: selection.orientation, row: preview.row, col: preview.col,
+  });
+  if (!ok) {
+    showMessage(data.error, true);
+    $('board').classList.remove('shake');
+    void $('board').offsetWidth;
+    $('board').classList.add('shake');
+    return;
+  }
+  selection = null;
+  showMessage('');
+  applyState(data);
+}
+
+function showMessage(text, isError) {
+  const el = $('message');
+  el.textContent = text;
+  el.classList.toggle('error', !!isError);
+  clearTimeout(messageTimer);
+  if (isError) messageTimer = setTimeout(() => showMessage(''), 6000);
+}
+
+function drawStatus() {
+  const status = $('status');
+  const color = state.current_color;
+  status.innerHTML = '';
+  const dot = document.createElement('span');
+  dot.className = 'dot';
+  dot.style.background = COLOR_VAR[color];
+  const text = document.createElement('span');
+  if (state.status === 'finished') {
+    status.append(Object.assign(text, {textContent: 'Game over'}));
+  } else if (state.status === 'error') {
+    status.append(Object.assign(text, {textContent: 'The AI crashed; see the terminal'}));
+  } else if (state.your_turn) {
+    text.textContent = `Your turn: ${meta.color_names[color]}`;
+    status.append(dot, text);
+  } else {
+    text.textContent = `AI thinking: ${meta.color_names[color]} ${state.think_seconds.toFixed(1)}s`;
+    status.append(dot, text);
+  }
+}
+
+function drawScores() {
+  const you = state.agent_scores[state.human_agent], ai = state.agent_scores[1 - state.human_agent];
+  const moverIsYou = state.current_agent === state.human_agent;
+  $('totals').innerHTML =
+    `<div class="total ${moverIsYou ? 'mover' : ''}"><span>You</span><b id="scoreYou">${you}</b></div>` +
+    `<div class="total ${moverIsYou ? '' : 'mover'}"><span>AI</span><b id="scoreAi">${ai}</b></div>`;
+  const box = $('colors');
+  box.innerHTML = '';
+  for (let c = 0; c < 4; c++) {
+    const row = document.createElement('div');
+    row.className = 'colorrow';
+    const mine = c % 2 === state.human_agent;
+    const left = state.pieces_remaining[c].reduce((n, id) => n + meta.pieces[id].size, 0);
+    row.innerHTML = `<header><i class="dot" style="background:${COLOR_VAR[c]}"></i>` +
+      `${meta.color_names[c]} <small style="color:var(--muted)">${mine ? 'you' : 'AI'}</small>` +
+      `<span class="num">${state.color_scores[c]} placed, ${left} left</span></header>`;
+    const mini = document.createElement('div');
+    mini.className = 'mini';
+    mini.style.setProperty('--shape', COLOR_VAR[c]);
+    for (const id of state.pieces_remaining[c]) mini.append(shapeEl(meta.pieces[id].orientations[0], 4));
+    row.append(mini);
+    box.append(row);
+  }
+}
+
+function drawLog() {
+  const log = $('log');
+  log.innerHTML = '';
+  for (const m of [...state.moves].reverse()) {
+    const li = document.createElement('li');
+    const who = m.actor === 'human' ? 'You' : 'AI';
+    const what = m.type === 'pass' ? 'no moves, passed' : `${m.piece_name} at ${m.row},${m.col}`;
+    const extra = m.sims ? `${m.sims} sims, ${m.seconds.toFixed(1)}s` : '';
+    li.innerHTML = `<i class="dot" style="background:${COLOR_VAR[m.color]}"></i>` +
+      `<span>${m.ply + 1}. ${who}: ${what}</span><span class="dim">${extra}</span>`;
+    log.append(li);
+  }
+}
+
+function drawBanner() {
+  const b = $('banner');
+  if (state.status !== 'finished' || !state.result) {
+    b.classList.remove('show');
+    return;
+  }
+  const r = state.result;
+  const headline = r.winner === 'human' ? 'You win' : (r.winner === 'ai' ? 'The AI wins' : 'Draw');
+  b.innerHTML = `<strong id="result">${headline}, ${r.human_score} to ${r.ai_score}</strong>` +
+    `Saved to <code>${state.record_path}</code>`;
+  b.classList.add('show');
+}
+
+function applyState(next) {
+  state = next;
+  legalSet = new Set(state.legal.map(m => m.join(',')));
+  legalByShape = new Map();
+  for (const [p, o, r, c] of state.legal) {
+    const key = `${p},${o}`;
+    if (!legalByShape.has(key)) legalByShape.set(key, []);
+    legalByShape.get(key).push([r, c]);
+  }
+  if (!state.your_turn) selection = null;
+
+  // Polling only needs a full redraw when the position changes.
+  const key = `${state.game_id}:${state.moves.length}:${state.your_turn}:${state.status}`;
+  drawStatus();
+  if (key !== lastBoardKey) {
+    lastBoardKey = key;
+    drawBoard();
+    drawTray();
+    drawLegal();
+    drawPreview();
+    drawScores();
+    drawLog();
+    drawBanner();
+    if (state.error) showMessage(state.error.trim().split('\n').pop(), true);
+  }
+
+  clearTimeout(pollTimer);
+  if (state.thinking || (state.status === 'playing' && !state.your_turn)) {
+    pollTimer = setTimeout(poll, 250);
+  }
+}
+
+async function poll() {
+  const {data} = await api('/api/state');
+  if (data.status !== 'none') applyState(data);
+}
+
+function openDialog() {
+  const d = meta.defaults;
+  $('sims').value = d.sims;
+  $('think').value = d.think_seconds;
+  $('speedNote').textContent = `Search runs at roughly 250 simulations per second on this machine (${meta.device}).`;
+  const select = $('checkpoint');
+  select.innerHTML = '';
+  for (const path of meta.checkpoints) {
+    const option = document.createElement('option');
+    option.value = option.textContent = path;
+    if (path === meta.default_checkpoint) option.selected = true;
+    select.append(option);
+  }
+  $('cancelNew').hidden = !state;
+  setSide(chosenSide);
+  $('dialog').showModal();
+}
+
+function setSide(side) {
+  chosenSide = side;
+  for (const b of document.querySelectorAll('.sidepick button')) {
+    b.classList.toggle('on', +b.dataset.side === side);
+  }
+}
+
+async function startGame() {
+  $('startNew').disabled = true;
+  const {ok, data} = await api('/api/new', {
+    side: chosenSide,
+    sims: +$('sims').value,
+    think_seconds: +$('think').value,
+    checkpoint: $('checkpoint').value,
+  });
+  $('startNew').disabled = false;
+  if (!ok) { $('speedNote').textContent = data.error; return; }
+  $('dialog').close();
+  selection = null;
+  lastBoardKey = '';
+  showMessage('');
+  applyState(data);
+}
+
+document.addEventListener('keydown', e => {
+  if ($('dialog').open) return;
+  if (e.key === 'r' || e.key === 'R') rotate();
+  else if (e.key === 'f' || e.key === 'F') flip();
+  else if (e.key === 'Escape') { selection = null; redrawSelection(); }
+});
+
+async function init() {
+  buildBoard();
+  meta = (await api('/api/meta')).data;
+  $('rotate').addEventListener('click', rotate);
+  $('flip').addEventListener('click', flip);
+  $('deselect').addEventListener('click', () => { selection = null; redrawSelection(); });
+  $('newgame').addEventListener('click', openDialog);
+  $('startNew').addEventListener('click', startGame);
+  $('cancelNew').addEventListener('click', () => $('dialog').close());
+  for (const b of document.querySelectorAll('.sidepick button')) {
+    b.addEventListener('click', () => setSide(+b.dataset.side));
+  }
+  const {data} = await api('/api/state');
+  if (data.status && data.status !== 'none') applyState(data);
+  else openDialog();
+}
+init();
+</script>
+</body>
+</html>

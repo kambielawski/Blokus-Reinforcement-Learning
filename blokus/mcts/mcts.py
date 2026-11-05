@@ -11,6 +11,7 @@ Optimizations:
 """
 
 import math
+import time
 import numpy as np
 import torch
 from typing import Optional, Dict, List, Tuple
@@ -83,6 +84,15 @@ class MCTS:
         temperature: Temperature for action selection from visit counts.
         device: PyTorch device for network inference.
         batch_size: Number of leaves to batch for NN inference (0 = no batching).
+        top_k_actions: Keep only this many highest-prior children (0 = all).
+        value_scale: Multiplier on network values before they enter Q, clamped
+            to [-1, 1]. Score-diff networks predict values around +/-0.05, far
+            below the PUCT exploration term, so 1.0 leaves search following the
+            prior. Terminal rewards are unaffected unless terminal_score_diff.
+        terminal_score_diff: Value terminal nodes by the score differential on
+            the same scale as the network (dual mode), not as +/-1 win/loss.
+        time_limit: Stop searching after this many seconds, even if
+            num_simulations has not been reached (None = no limit).
     """
 
     def __init__(self, network, c_puct: float = 1.5,
@@ -92,7 +102,10 @@ class MCTS:
                  temperature: float = 1.0,
                  device: Optional[torch.device] = None,
                  batch_size: int = 8,
-                 top_k_actions: int = 0):
+                 top_k_actions: int = 0,
+                 value_scale: float = 1.0,
+                 terminal_score_diff: bool = False,
+                 time_limit: Optional[float] = None):
         self.network = network
         self.c_puct = c_puct
         self.num_simulations = num_simulations
@@ -102,6 +115,11 @@ class MCTS:
         self.device = device or torch.device('cpu')
         self.batch_size = batch_size
         self.top_k_actions = top_k_actions
+        self.value_scale = value_scale
+        self.terminal_score_diff = terminal_score_diff
+        self.time_limit = time_limit
+        # Filled in by search(): {'sims', 'seconds', 'value', 'children'}
+        self.last_stats: Optional[dict] = None
         # Virtual loss magnitude — discourages re-selecting the same leaf
         self._virtual_loss = 3.0
 
@@ -112,18 +130,31 @@ class MCTS:
             policy: (ACTION_SPACE_SIZE,) visit count distribution (normalized).
             value: Root value estimate.
         """
+        started = time.monotonic()
+        deadline = None if self.time_limit is None else started + self.time_limit
+
         root = MCTSNode(state)
         # Expand root synchronously (need priors before batched search)
         self._expand_single(root, add_noise=True)
 
         sims_done = 0
         while sims_done < self.num_simulations:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             if self.batch_size > 1:
                 sims_done += self._run_batched_sims(root, sims_done)
             else:
                 self._run_single_sim(root)
                 sims_done += 1
 
+        self.last_stats = {
+            'sims': sims_done,
+            'seconds': time.monotonic() - started,
+            'value': root.mean_value,
+            # action -> (visits, Q from the root player's view, prior)
+            'children': {a: (c.visit_count, -c.mean_value, c.prior)
+                         for a, c in root.children.items()},
+        }
         return self._get_policy(root), root.mean_value
 
     def select_action(self, state: GameState) -> Tuple[int, np.ndarray, float]:
@@ -450,6 +481,8 @@ class MCTS:
         log_policy, value = self.network(board_t, pieces_t, mask_t, score_vector=score_t)
 
         policies = torch.exp(log_policy).cpu().numpy()
+        if self.value_scale != 1.0:
+            value = torch.clamp(value * self.value_scale, -1.0, 1.0)
         values = value.cpu().tolist()
 
         return policies, values
@@ -457,8 +490,14 @@ class MCTS:
     def _terminal_value(self, node: MCTSNode) -> float:
         """Get value for a terminal node from actual game rewards."""
         state = node.ensure_state()
-        rewards = state.get_rewards()
         agent = state.get_current_agent()
+        if self.terminal_score_diff and state.game_mode == 'dual':
+            scores = state.get_scores()
+            s0, s1 = scores[0] + scores[2], scores[1] + scores[3]
+            diff = (s0 - s1) / max(s0 + s1, 1)
+            scaled = max(-1.0, min(1.0, diff * self.value_scale))
+            return scaled if agent == 0 else -scaled
+        rewards = state.get_rewards()
         return rewards.get(agent, 0.0)
 
     def _backup(self, node: MCTSNode, value: float) -> None:

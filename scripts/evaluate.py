@@ -19,25 +19,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from blokus.engine.game_state import GameState, ACTION_SPACE_SIZE
 from blokus.nn.network import BlokusNetwork, make_pieces_remaining_vector
 from blokus.mcts.mcts import MCTS
+from blokus.nn.checkpoint import load_network
 
 
 def load_checkpoint(path: str, device: torch.device):
     """Load checkpoint and return network."""
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    cfg = ckpt.get('config', {})
-    num_blocks = cfg.get('network', {}).get('num_blocks', 5)
-    channels = cfg.get('network', {}).get('channels', 128)
-    # Fallback for older checkpoints that stored flat config
-    if 'num_blocks' in cfg:
-        num_blocks = cfg['num_blocks']
-    if 'channels' in cfg:
-        channels = cfg['channels']
-
-    network = BlokusNetwork(num_blocks=num_blocks, channels=channels).to(device)
-    network.load_state_dict(ckpt['model_state_dict'])
-    network.eval()
-    iteration = ckpt.get('iteration', '?')
-    print(f"Loaded checkpoint: iteration {iteration}, {num_blocks} blocks, {channels} channels")
+    network, info = load_network(path, device)
+    print(f"Loaded checkpoint: iteration {info['iteration']}, "
+          f"{network.num_blocks} blocks, {network.channels} channels")
     return network
 
 
