@@ -78,6 +78,9 @@ class PlayServer:
                 batch_size=int(merged['batch_size']), top_k=int(merged['top_k']),
                 value_scale=float(merged['value_scale']),
                 terminal_score_diff=bool(merged['terminal_score_diff']),
+                # Networks trained on score margin say so in their config
+                terminal_margin_scale=float(
+                    net_info['config'].get('training', {}).get('margin_scale', 0.0)),
                 time_limit=time_limit or None,
             )
             ai_info = {

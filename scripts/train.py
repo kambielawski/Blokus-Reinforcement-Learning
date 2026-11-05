@@ -22,6 +22,7 @@ import argparse
 import glob
 import math
 import os
+import signal
 import sys
 import time
 import torch
@@ -38,9 +39,14 @@ sys.path.insert(0, REPO_ROOT)
 
 from blokus.nn.network import BlokusNetwork, make_pieces_remaining_vector, make_score_vector
 from blokus.agents.alpha_zero import self_play_game, TrainingExample
+from blokus.agents.bots import MctsBot, MobilityBot, random_opening
+from blokus.engine.symmetry import mirror_action_table
+from blokus.nn.checkpoint import load_network
 from blokus.engine.game_state import GameState, ACTION_SPACE_SIZE, ACTION_ENCODING_VERSION
 from blokus.mcts.mcts import MCTS
 
+
+EXIT_REQUEUE = 85  # Tells the Slurm script to resubmit; see slurm/tufts/
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -118,10 +124,19 @@ def apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> None:
 # Checkpointing
 # ---------------------------------------------------------------------------
 
+def _atomic_torch_save(payload: Dict[str, Any], path: str) -> None:
+    """Write a checkpoint so a kill mid-save leaves the previous file intact."""
+    temp_path = f'{path}.tmp'
+    torch.save(payload, temp_path)
+    os.replace(temp_path, path)
+
+
 class CheckpointManager:
     """Manages saving/loading checkpoints with best-model tracking."""
 
-    def __init__(self, save_dir: str, save_every: int = 1, keep_top_k: int = 3):
+    def __init__(self, save_dir: str, save_every: int = 1, keep_top_k: int = 3,
+                 keep_every: int = 0):
+        self.keep_every = keep_every
         self.save_dir = save_dir
         self.save_every = save_every
         self.keep_top_k = keep_top_k
@@ -152,11 +167,11 @@ class CheckpointManager:
 
         # Always save as 'latest'
         latest_path = os.path.join(self.save_dir, 'checkpoint_latest.pt')
-        torch.save(payload, latest_path)
+        _atomic_torch_save(payload, latest_path)
 
         # Save numbered checkpoint
         iter_path = os.path.join(self.save_dir, f'checkpoint_{iteration:04d}.pt')
-        torch.save(payload, iter_path)
+        _atomic_torch_save(payload, iter_path)
 
         # Save replay buffer separately using np.savez (streams arrays to
         # disk without pickle).
@@ -177,7 +192,10 @@ class CheckpointManager:
             else:
                 save_kwargs['legal_masks'] = replay_state['legal_masks']
                 save_kwargs['policy_targets'] = replay_state['policy_targets']
-            np.savez(buf_path, **save_kwargs)
+            # A kill during a save must not destroy the previous buffer
+            temp_path = os.path.join(self.save_dir, 'replay_buffer.tmp.npz')
+            np.savez(temp_path, **save_kwargs)
+            os.replace(temp_path, buf_path)
 
         return iter_path
 
@@ -203,7 +221,9 @@ class CheckpointManager:
         # Remove checkpoints outside top K (but never remove 'latest')
         for e in entries[self.keep_top_k:]:
             old_path = os.path.join(self.save_dir, f'checkpoint_{e["iteration"]:04d}.pt')
-            if os.path.exists(old_path):
+            # Periodic checkpoints stay: the strength ladder needs them later
+            is_history = self.keep_every > 0 and e['iteration'] % self.keep_every == 0
+            if os.path.exists(old_path) and not is_history:
                 os.remove(old_path)
 
         entries = entries[:self.keep_top_k]
@@ -223,7 +243,7 @@ class CheckpointManager:
                 'action_encoding': ACTION_ENCODING_VERSION,
                 **meta_clean,
             }
-            torch.save(payload, best_ckpt_path)
+            _atomic_torch_save(payload, best_ckpt_path)
 
     def load_latest(self, device: torch.device) -> Optional[Dict[str, Any]]:
         """Load the latest checkpoint if it exists."""
@@ -368,11 +388,13 @@ class ReplayBuffer:
         policy_target[indices] = self._policy_values[idx]
         return legal_mask, policy_target
 
-    def reconstruct_sparse_batch(self, indices: np.ndarray):
+    def reconstruct_sparse_batch(self, indices: np.ndarray,
+                                 mirror: Optional[np.ndarray] = None):
         """Reconstruct dense legal_masks and policy_targets for a mini-batch.
 
         Args:
             indices: 1D array of example indices (int).
+            mirror: Optional bool array; examples marked True get mirrored actions.
 
         Returns:
             (legal_masks, policy_targets) as numpy arrays of shape
@@ -383,6 +405,8 @@ class ReplayBuffer:
         policy_targets = np.zeros((n, self._ACTION_SIZE), dtype=np.float32)
         for i, idx in enumerate(indices):
             li = self._legal_indices[idx]
+            if mirror is not None and mirror[i]:
+                li = mirror_action_table()[li]
             legal_masks[i, li] = 1.0
             policy_targets[i, li] = self._policy_values[idx]
         return legal_masks, policy_targets
@@ -537,8 +561,8 @@ class ReplayBuffer:
 # ---------------------------------------------------------------------------
 
 def _self_play_worker(rank: int, model_state_dict: dict, config: dict,
-                      result_queue: mp.Queue) -> None:
-    """Worker process that plays one self-play game.
+                      result_queue: mp.Queue, games: int) -> None:
+    """Worker process that plays config['games_per_worker'] self-play games.
 
     Workers use the configured device (typically GPU).  The CUDA OOM fix is
     in train_on_examples (mini-batch GPU loading), so GPU memory is free
@@ -554,19 +578,23 @@ def _self_play_worker(rank: int, model_state_dict: dict, config: dict,
     network.load_state_dict(model_state_dict)
     network.eval()
 
-    examples = self_play_game(
-        network=network,
-        game_mode=config['game_mode'],
-        num_simulations=config['sims'],
-        c_puct=config['c_puct'],
-        temp_threshold=config['temp_threshold_move'],
-        max_moves=config['max_moves'],
-        device=device,
-        top_k_actions=config.get('top_k_actions', 0),
-        score_diff_targets=config.get('score_diff_targets', False),
-        use_score_input=config.get('score_input', False),
-    )
-    result_queue.put(examples)
+    for _ in range(games):
+        examples = self_play_game(
+            network=network,
+            game_mode=config['game_mode'],
+            num_simulations=config['sims'],
+            c_puct=config['c_puct'],
+            temp_threshold=config['temp_threshold_move'],
+            max_moves=config['max_moves'],
+            device=device,
+            top_k_actions=config.get('top_k_actions', 0),
+            score_diff_targets=config.get('score_diff_targets', False),
+            use_score_input=config.get('score_input', False),
+            margin_scale=config.get('margin_scale', 0.0),
+            root_top_k=config.get('root_top_k'),
+            dirichlet_alpha=config.get('dirichlet_alpha', 0.3),
+        )
+        result_queue.put(examples)
 
 
 def run_self_play_parallel(network: BlokusNetwork, num_games: int,
@@ -578,31 +606,29 @@ def run_self_play_parallel(network: BlokusNetwork, num_games: int,
     ctx = mp.get_context('spawn')
     result_queue = ctx.Queue()
 
+    # Workers each play several games, so startup cost is paid once per iteration
+    num_procs = min(num_workers, num_games)
+    shares = [num_games // num_procs + (i < num_games % num_procs) for i in range(num_procs)]
+    processes = []
+    for rank, games in enumerate(shares):
+        p = ctx.Process(
+            target=_self_play_worker,
+            args=(rank, model_state, config, result_queue, games),
+            daemon=True,
+        )
+        p.start()
+        processes.append(p)
+
     all_examples: List[TrainingExample] = []
-    games_launched = 0
-    games_collected = 0
-
-    while games_collected < num_games:
-        batch = min(num_workers, num_games - games_launched)
-        processes = []
-        for i in range(batch):
-            p = ctx.Process(
-                target=_self_play_worker,
-                args=(games_launched + i, model_state, config, result_queue),
-            )
-            p.start()
-            processes.append(p)
-        games_launched += batch
-
-        for _ in range(batch):
-            examples = result_queue.get()
-            all_examples.extend(examples)
-            games_collected += 1
+    for games_collected in range(1, num_games + 1):
+        examples = result_queue.get()
+        all_examples.extend(examples)
+        if games_collected % 25 == 0 or games_collected == num_games:
             print(f"  Game {games_collected}/{num_games}: "
-                  f"{len(examples)} examples", flush=True)
+                  f"{len(all_examples)} examples so far", flush=True)
 
-        for p in processes:
-            p.join()
+    for p in processes:
+        p.join()
 
     return all_examples
 
@@ -627,6 +653,9 @@ def run_self_play_sequential(network: BlokusNetwork, num_games: int,
             top_k_actions=cfg['mcts'].get('top_k_actions', 0),
             score_diff_targets=cfg['training'].get('score_diff_targets', False),
             use_score_input=cfg['training'].get('score_input', False),
+            margin_scale=cfg['training'].get('margin_scale', 0.0),
+            root_top_k=cfg['mcts'].get('root_top_k'),
+            dirichlet_alpha=cfg['mcts'].get('dirichlet_alpha', 0.3),
         )
         dt = time.time() - t0
         print(f" {len(examples)} examples in {dt:.1f}s")
@@ -644,11 +673,16 @@ def train_on_examples(network: BlokusNetwork,
                       batch_size: int = 64,
                       epochs: int = 5,
                       value_loss_weight: float = 1.0,
-                      device: torch.device = torch.device('cpu')
+                      device: torch.device = torch.device('cpu'),
+                      mirror_augment: bool = False,
                       ) -> dict:
     """Train the network on replay buffer contents.
 
     Loss = policy_loss + value_loss_weight * MSE(value_pred, value_target)
+
+    A fractional `epochs` trains on that share of the buffer, chosen at random,
+    so the number of times each example is reused can be set directly.
+    With mirror_augment, each sample is left-right mirrored with probability 1/2.
 
     Dense columns (board, pieces, value) are zero-copy CPU tensor views.
     Sparse columns (legal_mask, policy_target) are reconstructed per
@@ -664,15 +698,26 @@ def train_on_examples(network: BlokusNetwork,
     total_value_loss = 0.0
     total_batches = 0
 
-    for epoch in range(epochs):
+    for epoch in range(math.ceil(epochs)):
         perm = torch.randperm(n)
+        # Only the last pass of a fractional epoch count is partial
+        share = epochs - epoch if epochs - epoch < 1 else 1.0
+        samples = max(1, int(n * share))
 
-        for i in range(0, n, batch_size):
-            end = min(i + batch_size, n)
+        for i in range(0, samples, batch_size):
+            end = min(i + batch_size, samples)
             idx = perm[i:end]
+            mirror = None
+            if mirror_augment:
+                mirror = np.random.random(len(idx)) < 0.5
 
             # Dense columns — move to device
-            bs = board_states[idx].to(device, non_blocking=True)
+            bs = board_states[idx]
+            if mirror is not None:
+                bs = bs.clone()
+                flip = torch.from_numpy(mirror)
+                bs[flip] = torch.flip(bs[flip], dims=[-1])
+            bs = bs.to(device, non_blocking=True)
             pv = pieces_vecs[idx].to(device, non_blocking=True)
             vt = value_targets[idx].to(device, non_blocking=True)
             sv = None
@@ -680,7 +725,7 @@ def train_on_examples(network: BlokusNetwork,
                 sv = score_vectors[idx].to(device, non_blocking=True)
 
             # Sparse → dense reconstruction for this mini-batch
-            lm_np, pt_np = replay_buffer.reconstruct_sparse_batch(idx.numpy())
+            lm_np, pt_np = replay_buffer.reconstruct_sparse_batch(idx.numpy(), mirror)
             lm = torch.from_numpy(lm_np).to(device, non_blocking=True)
             pt = torch.from_numpy(pt_np).to(device, non_blocking=True)
 
@@ -722,6 +767,7 @@ def train_on_examples(network: BlokusNetwork,
             non_draw += mask.sum().item()
             correct += ((vp[mask] > 0) == (vt[mask] > 0)).sum().item()
 
+    # Accuracy pass covers the whole buffer without augmentation
     value_accuracy = correct / max(non_draw, 1)
 
     return {
@@ -887,6 +933,45 @@ def evaluate_vs_random(network, device, num_games, mcts_sims, game_mode):
     return results
 
 
+def evaluate_vs_mobility(network, device, num_pairs: int, mcts_sims: int,
+                         margin_scale: float, top_k: int) -> Dict[str, float]:
+    """Play paired games with seats swapped against the mobility heuristic.
+
+    Win rate against random saturates near 100% and hides real weakness, so this
+    is the strength signal used to choose the best checkpoint.
+    """
+    network.eval()
+    bot = MctsBot(network, device, sims=mcts_sims, top_k=top_k,
+                  terminal_margin_scale=margin_scale)
+    opponent = MobilityBot(seed=0)
+    points = 0.0
+    margins = []
+    t0 = time.time()
+    for pair in range(num_pairs):
+        opening = random_opening(pair)
+        for bot_agent in (0, 1):
+            state = GameState.new_game('dual')
+            for action in opening:
+                state = state.apply_action(action)
+            while not state.is_terminal():
+                if not state.get_legal_actions():
+                    state = state.pass_turn()
+                    continue
+                player = bot if state.get_current_agent() == bot_agent else opponent
+                state = state.apply_action(player.select_action(state))
+            scores = state.get_scores()
+            margin = (scores[bot_agent] + scores[bot_agent + 2]
+                      - scores[1 - bot_agent] - scores[3 - bot_agent])
+            margins.append(margin)
+            points += 1.0 if margin > 0 else (0.5 if margin == 0 else 0.0)
+    network.train()
+    games = 2 * num_pairs
+    print(f"  Eval vs mobility: score={points / games:.1%}, "
+          f"avg_margin={np.mean(margins):+.1f} ({games} games in {time.time() - t0:.0f}s)")
+    return {'eval/mobility_score': points / games,
+            'eval/mobility_margin': float(np.mean(margins))}
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -922,6 +1007,13 @@ def main():
     parser.add_argument('--score-diff-targets', action='store_true', default=None, dest='score_diff_targets')
     parser.add_argument('--score-input', action='store_true', default=None, dest='score_input')
     parser.add_argument('--eval-interval', type=int, default=None, dest='eval_interval')
+    parser.add_argument('--target-iteration', type=int, default=None,
+                        help='Stop at this absolute iteration, so restarts keep the same '
+                             'goal and learning-rate curve. Without it, --iterations more '
+                             'are run from wherever training resumes.')
+    parser.add_argument('--init-weights', type=str, default=None,
+                        help='Start from these network weights only (fresh optimizer, '
+                             'iteration 0, empty buffer). Ignored if --resume finds a checkpoint.')
     args = parser.parse_args()
 
     # Load config
@@ -969,6 +1061,7 @@ def main():
         save_dir=cfg['checkpoint']['dir'],
         save_every=cfg['checkpoint']['save_every_n_iters'],
         keep_top_k=cfg['checkpoint']['keep_top_k'],
+        keep_every=cfg['checkpoint'].get('keep_every', 0),
     )
 
     # Replay buffer
@@ -1010,7 +1103,8 @@ def main():
                 print("  WARNING: Skipping optimizer state (model shape changed)")
             else:
                 network.load_state_dict(ckpt_sd)
-                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                if 'optimizer_state_dict' in ckpt:
+                    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
             start_iteration = ckpt.get('iteration', 0) + 1
             cumulative_games = ckpt.get('cumulative_games', 0)
             cumulative_examples = ckpt.get('cumulative_examples', 0)
@@ -1052,6 +1146,14 @@ def main():
             del ckpt  # Free checkpoint memory
         else:
             print("No checkpoint found — starting from scratch")
+
+    if args.init_weights and start_iteration == 1:
+        weights, info = load_network(args.init_weights, device)
+        if weights.legacy_action_encoding:
+            sys.exit('--init-weights needs action encoding 2; '
+                     'pre-v2 policy channels are offset and would train wrongly.')
+        network.load_state_dict(weights.state_dict())
+        print(f"Initialized weights from {args.init_weights}")
 
     # W&B setup
     wandb_run = None
@@ -1098,6 +1200,9 @@ def main():
         'value_dropout': value_dropout,
         'score_diff_targets': score_diff_targets,
         'score_input': score_input,
+        'margin_scale': cfg['training'].get('margin_scale', 0.0),
+        'root_top_k': cfg['mcts'].get('root_top_k'),
+        'dirichlet_alpha': cfg['mcts'].get('dirichlet_alpha', 0.3),
     }
 
     num_workers = cfg['self_play']['num_workers']
@@ -1111,6 +1216,21 @@ def main():
 
     total_iterations = cfg['training']['iterations']
     end_iteration = start_iteration + total_iterations - 1
+    if args.target_iteration is not None:
+        end_iteration = args.target_iteration
+
+    # On SIGTERM or USR1, stop after the current iteration and exit with
+    # EXIT_REQUEUE so the job script can resubmit itself. A worker's copy of the
+    # default handler lets it die with the job; progress is already on disk.
+    stop_requested = {'flag': False}
+
+    def request_stop(signum, frame) -> None:
+        print(f"Signal {signum}: stopping after this iteration", flush=True)
+        stop_requested['flag'] = True
+
+    signal.signal(signal.SIGTERM, request_stop)
+    if hasattr(signal, 'SIGUSR1'):
+        signal.signal(signal.SIGUSR1, request_stop)
 
     # LR schedule: cosine decay with linear warmup
     lr_cfg = cfg['training'].get('lr_schedule', {})
@@ -1139,10 +1259,18 @@ def main():
           f"{cfg['mcts']['num_simulations']} sims, "
           f"{lr_info}")
 
+    # Survives restarts, so a resumed run cannot replace the best with a worse model
+    best_mobility_score = -1.0
+    best_eval_path = os.path.join(cfg['checkpoint']['dir'], 'checkpoint_best_eval.pt')
+    if os.path.exists(best_eval_path):
+        best_eval = torch.load(best_eval_path, map_location='cpu', weights_only=False)
+        best_mobility_score = best_eval['eval']['eval/mobility_score']
+        del best_eval
+
     # Training loop
     for iteration in range(start_iteration, end_iteration + 1):
-        print(f"\n{'='*60}")
-        print(f"Iteration {iteration}/{end_iteration}")
+        print(f"\n{'='*60}", flush=True)
+        print(f"Iteration {iteration}/{end_iteration}", flush=True)
         print(f"{'='*60}")
 
         # ------ Self-play ------
@@ -1208,6 +1336,7 @@ def main():
             epochs=cfg['training']['epochs_per_iter'],
             value_loss_weight=cfg['training'].get('value_loss_weight', 1.0),
             device=device,
+            mirror_augment=cfg['training'].get('mirror_augment', False),
         )
         train_time = time.time() - t_tr
 
@@ -1255,13 +1384,32 @@ def main():
         eval_cfg = cfg.get('eval', {})
         eval_interval = eval_cfg.get('interval', 0)
         if eval_interval > 0 and iteration % eval_interval == 0:
-            eval_metrics = evaluate_vs_random(
-                network=network,
-                device=device,
-                num_games=eval_cfg.get('games', 50),
-                mcts_sims=eval_cfg.get('mcts_sims', 25),
-                game_mode=cfg['self_play']['game_mode'],
-            )
+            if eval_cfg.get('games', 50) > 0:
+                eval_metrics = evaluate_vs_random(
+                    network=network,
+                    device=device,
+                    num_games=eval_cfg.get('games', 50),
+                    mcts_sims=eval_cfg.get('mcts_sims', 25),
+                    game_mode=cfg['self_play']['game_mode'],
+                )
+            mobility_pairs = eval_cfg.get('mobility_pairs', 0)
+            if mobility_pairs > 0:
+                margin_scale = cfg['training'].get('margin_scale', 0.0)
+                mobility = evaluate_vs_mobility(
+                    network, device, mobility_pairs,
+                    eval_cfg.get('mobility_sims', 100), margin_scale,
+                    cfg['mcts'].get('top_k_actions', 0),
+                )
+                eval_metrics.update(mobility)
+                # Best is decided by play, not by training loss
+                if mobility['eval/mobility_score'] > best_mobility_score:
+                    best_mobility_score = mobility['eval/mobility_score']
+                    _atomic_torch_save(
+                        {'iteration': iteration, 'config': cfg,
+                         'model_state_dict': network.state_dict(),
+                         'action_encoding': ACTION_ENCODING_VERSION,
+                         'eval': mobility},
+                        best_eval_path)
             # Free GPU cache after eval games
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
@@ -1296,6 +1444,12 @@ def main():
             }
             log_data.update(eval_metrics)
             wandb.log(log_data, step=iteration)
+
+        if stop_requested['flag'] and iteration < end_iteration:
+            print(f"Stopped after iteration {iteration}; requeue to continue.", flush=True)
+            if wandb_run:
+                wandb_run.finish()
+            sys.exit(EXIT_REQUEUE)
 
     print(f"\nTraining complete: {cumulative_games} games, "
           f"{cumulative_examples} examples over {total_iterations} iterations")

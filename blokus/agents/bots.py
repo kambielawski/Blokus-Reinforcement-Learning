@@ -79,6 +79,24 @@ def _flood_territory(mine: int, theirs: int, step: Callable[[int], int]) -> int:
     return owned
 
 
+OPENING_PLIES = 4
+
+
+def random_opening(seed: int) -> List[int]:
+    """Legal opening actions: a random pentomino in each color's corner."""
+    rng = np.random.default_rng(seed)
+    pieces = load_pieces()
+    state = GameState.new_game('dual')
+    actions = []
+    for _ in range(OPENING_PLIES):
+        legal = state.get_legal_actions()
+        big = [a for a in legal if pieces[decode_action(a)[0]].num_cells == 5]
+        action = big[rng.integers(len(big))]
+        actions.append(action)
+        state = state.apply_action(action)
+    return actions
+
+
 class RandomBot:
     """Uniform random legal move."""
 
@@ -193,12 +211,14 @@ class MctsBot:
                  sims: int = 200, c_puct: float = 1.5, batch_size: int = 8,
                  top_k: int = 50, value_scale: float = 1.0,
                  terminal_score_diff: bool = False,
+                 terminal_margin_scale: float = 0.0,
                  time_limit: Optional[float] = None):
         self.mcts = MCTS(
             network=network, c_puct=c_puct, num_simulations=sims,
             dirichlet_alpha=0.0, dirichlet_epsilon=0.0, temperature=0.0,
             device=device, batch_size=batch_size, top_k_actions=top_k,
             value_scale=value_scale, terminal_score_diff=terminal_score_diff,
+            terminal_margin_scale=terminal_margin_scale,
             time_limit=time_limit,
         )
 

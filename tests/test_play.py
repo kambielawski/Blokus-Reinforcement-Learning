@@ -246,3 +246,30 @@ class TestBots:
         state = GameState.new_game('dual')
         action = GreedySizeBot(seed=0).select_action(state)
         assert state.pieces[decode_action(action)[0]].num_cells == 5
+
+
+class TestMirrorSymmetry:
+    @pytest.mark.parametrize('plies', [0, 1, 2, 7, 20, 35, 50])
+    def test_mirror_preserves_legal_moves_and_network_input(self, plies):
+        from blokus.engine.symmetry import mirror_action_table, mirror_state
+        from blokus.nn.network import make_pieces_remaining_vector
+        state = play_random_plies(plies, seed=plies + 100)
+        mirrored = mirror_state(state)
+        table = mirror_action_table()
+        assert {int(table[a]) for a in state.get_legal_actions()} == set(mirrored.get_legal_actions())
+        assert np.array_equal(state.get_nn_state()[:, :, ::-1], mirrored.get_nn_state())
+        assert np.array_equal(make_pieces_remaining_vector(state),
+                              make_pieces_remaining_vector(mirrored))
+        assert state.get_scores()[0] == mirrored.get_scores()[2]
+
+    def test_mirror_of_action_covers_mirrored_cells(self):
+        from blokus.engine.symmetry import mirror_action_table
+        table = mirror_action_table()
+        pieces = load_pieces()
+        for action in np.nonzero(table >= 0)[0][::97]:
+            p, o, r, c = decode_action(int(action))
+            p2, o2, r2, c2 = decode_action(int(table[action]))
+            assert p == p2
+            cells = {(x + r, 19 - (y + c)) for x, y in pieces[p].orientations[o].occupied}
+            assert cells == {(x + r2, y + c2) for x, y in pieces[p2].orientations[o2].occupied}
+            assert table[table[action]] == action

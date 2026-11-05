@@ -4,6 +4,8 @@ Uses a neural network + MCTS to select moves, and provides self-play
 infrastructure for generating training data.
 """
 
+import math
+
 import numpy as np
 import torch
 from typing import List, Tuple, Optional
@@ -56,7 +58,9 @@ class AlphaZeroAgent:
                  dirichlet_epsilon: float = 0.25,
                  temperature: float = 1.0,
                  device: Optional[torch.device] = None,
-                 top_k_actions: int = 0):
+                 top_k_actions: int = 0,
+                 root_top_k: Optional[int] = None,
+                 terminal_margin_scale: float = 0.0):
         self.network = network
         self.device = device or torch.device('cpu')
         self.mcts = MCTS(
@@ -68,6 +72,8 @@ class AlphaZeroAgent:
             temperature=temperature,
             device=self.device,
             top_k_actions=top_k_actions,
+            root_top_k=root_top_k,
+            terminal_margin_scale=terminal_margin_scale,
         )
 
     def select_action(self, state: GameState) -> Tuple[int, np.ndarray]:
@@ -99,6 +105,9 @@ def self_play_game(network: BlokusNetwork,
                    top_k_actions: int = 0,
                    score_diff_targets: bool = False,
                    use_score_input: bool = False,
+                   margin_scale: float = 0.0,
+                   root_top_k: Optional[int] = None,
+                   dirichlet_alpha: float = 0.3,
                    ) -> List[TrainingExample]:
     """Play a complete self-play game and collect training examples.
 
@@ -115,6 +124,10 @@ def self_play_game(network: BlokusNetwork,
         device: PyTorch device.
         score_diff_targets: Use normalized score differential as value target.
         use_score_input: Record score vectors for score-input value head.
+        margin_scale: If > 0, value target is tanh(score margin / margin_scale),
+            also used for terminal nodes in search. Overrides score_diff_targets.
+        root_top_k: Children kept at the root (see MCTS).
+        dirichlet_alpha: Root noise concentration.
 
     Returns:
         List of TrainingExample objects for training.
@@ -127,6 +140,9 @@ def self_play_game(network: BlokusNetwork,
         temperature=1.0,
         device=device,
         top_k_actions=top_k_actions,
+        root_top_k=root_top_k,
+        terminal_margin_scale=margin_scale,
+        dirichlet_alpha=dirichlet_alpha,
     )
 
     state = GameState.new_game(game_mode)
@@ -169,7 +185,10 @@ def self_play_game(network: BlokusNetwork,
     # Game over: compute value targets
     scores = state.get_scores()
 
-    if score_diff_targets:
+    if margin_scale > 0 and game_mode == 'dual':
+        margin = math.tanh((scores[0] + scores[2] - scores[1] - scores[3]) / margin_scale)
+        agent_values = {0: margin, 1: -margin}
+    elif score_diff_targets:
         # Normalized score differential per agent
         if game_mode == 'dual':
             s0 = scores[0] + scores[2]

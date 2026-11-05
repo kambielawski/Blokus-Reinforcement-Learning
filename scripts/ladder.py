@@ -8,7 +8,7 @@ finish, and rerunning with the same --out skips games already recorded.
 Player specs are name=kind[:key=value...]. Kinds:
     random, size, space1, space2, mobility
     raw:ckpt=PATH
-    mcts:ckpt=PATH,sims=200,vs=1,batch=8,topk=50,cpuct=1.5,tsd=0
+    mcts:ckpt=PATH,sims=200,vs=1,batch=8,topk=50,cpuct=1.5,tsd=0,margin=0
 
 Usage:
     python scripts/ladder.py --out data/ladder/base --pairs-per-matchup 20 \\
@@ -34,13 +34,11 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from blokus.agents.bots import (
-    GreedySizeBot, MctsBot, MobilityBot, RandomBot, RawPolicyBot, SpaceBot,
+    GreedySizeBot, MctsBot, MobilityBot, OPENING_PLIES, RandomBot, RawPolicyBot,
+    SpaceBot, random_opening,
 )
-from blokus.engine.game_state import GameState, decode_action, load_pieces
+from blokus.engine.game_state import GameState
 from blokus.nn.checkpoint import load_network
-
-OPENING_PLIES = 4  # one random pentomino per color, so games differ from move one
-
 
 def build_bot(spec: str, seed: int) -> Any:
     """Create a bot from the part of a player spec after 'name='."""
@@ -69,23 +67,9 @@ def build_bot(spec: str, seed: int) -> Any:
             top_k=int(opts.get('topk', 50)),
             value_scale=float(opts.get('vs', 1.0)),
             terminal_score_diff=bool(int(opts.get('tsd', 0))),
+            terminal_margin_scale=float(opts.get('margin', 0)),
         )
     raise ValueError(f'Unknown player kind: {kind}')
-
-
-def random_opening(seed: int) -> List[int]:
-    """Legal opening actions: a random pentomino in each color's corner."""
-    rng = np.random.default_rng(seed)
-    pieces = load_pieces()
-    state = GameState.new_game('dual')
-    actions = []
-    for _ in range(OPENING_PLIES):
-        legal = state.get_legal_actions()
-        big = [a for a in legal if pieces[decode_action(a)[0]].num_cells == 5]
-        action = big[rng.integers(len(big))]
-        actions.append(action)
-        state = state.apply_action(action)
-    return actions
 
 
 _BOTS: Dict[str, Any] = {}

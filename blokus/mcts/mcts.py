@@ -91,6 +91,12 @@ class MCTS:
             prior. Terminal rewards are unaffected unless terminal_score_diff.
         terminal_score_diff: Value terminal nodes by the score differential on
             the same scale as the network (dual mode), not as +/-1 win/loss.
+        terminal_margin_scale: If > 0, value terminal nodes as
+            tanh(score margin / scale), matching networks trained on that target.
+            Takes precedence over terminal_score_diff.
+        root_top_k: Children kept at the root (0 = all legal moves, None = same
+            as top_k_actions). Pruning the root by prior stops self-play from ever
+            finding a good move the policy currently ranks low.
         time_limit: Stop searching after this many seconds, even if
             num_simulations has not been reached (None = no limit).
     """
@@ -105,6 +111,8 @@ class MCTS:
                  top_k_actions: int = 0,
                  value_scale: float = 1.0,
                  terminal_score_diff: bool = False,
+                 terminal_margin_scale: float = 0.0,
+                 root_top_k: Optional[int] = None,
                  time_limit: Optional[float] = None):
         self.network = network
         self.c_puct = c_puct
@@ -117,6 +125,8 @@ class MCTS:
         self.top_k_actions = top_k_actions
         self.value_scale = value_scale
         self.terminal_score_diff = terminal_score_diff
+        self.terminal_margin_scale = terminal_margin_scale
+        self.root_top_k = root_top_k
         self.time_limit = time_limit
         # Filled in by search(): {'sims', 'seconds', 'value', 'children'}
         self.last_stats: Optional[dict] = None
@@ -392,8 +402,12 @@ class MCTS:
             priors[:] = 1.0 / len(legal)
 
         # Top-K pruning: only expand the most promising actions
-        if self.top_k_actions > 0 and len(legal) > self.top_k_actions:
-            top_indices = np.argpartition(priors, -self.top_k_actions)[-self.top_k_actions:]
+        # (add_noise is set only when expanding the root)
+        keep = self.top_k_actions
+        if add_noise and self.root_top_k is not None:
+            keep = self.root_top_k
+        if keep > 0 and len(legal) > keep:
+            top_indices = np.argpartition(priors, -keep)[-keep:]
             legal = [legal[i] for i in top_indices]
             priors = priors[top_indices]
             priors /= priors.sum()
@@ -491,6 +505,11 @@ class MCTS:
         """Get value for a terminal node from actual game rewards."""
         state = node.ensure_state()
         agent = state.get_current_agent()
+        if self.terminal_margin_scale > 0 and state.game_mode == 'dual':
+            scores = state.get_scores()
+            margin = scores[0] + scores[2] - scores[1] - scores[3]
+            value = math.tanh(margin / self.terminal_margin_scale)
+            return value if agent == 0 else -value
         if self.terminal_score_diff and state.game_mode == 'dual':
             scores = state.get_scores()
             s0, s1 = scores[0] + scores[2], scores[1] + scores[3]
