@@ -1,7 +1,7 @@
 #!/bin/bash
 # CPU strength ladder. Pass ladder.py arguments in LADDER_ARGS and an output dir name in NAME.
 #   sbatch --partition=batch --output="$BLOKUS_SCRATCH/logs/%x-%j.out" \
-#       --export=ALL,NAME=base,LADDER_ARGS="--pairs-per-matchup 40 --player ..." slurm/tufts/ladder.sbatch
+#       --export=ALL slurm/tufts/ladder.sbatch   # with NAME and LADDER_ARGS exported first: specs contain commas
 #
 #SBATCH --job-name=blokus-ladder
 #SBATCH --cpus-per-task=32
