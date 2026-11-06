@@ -140,7 +140,7 @@ def summarize(records: List[Dict[str, Any]]) -> str:
         matchups[(a, b)].append((result, diff, a_is_seat0))
 
     lines = [f"{'A':<22}{'B':<22}{'games':>6}{'W-D-L':>12}{'A score':>9}{'95% CI':>15}"
-             f"{'diff':>7}{'+/-':>6}{'worst':>7}{'as seat0':>10}{'as seat1':>10}"]
+             f"{'diff':>7}{'+/-':>6}{'A worst':>8}{'B worst':>8}{'as seat0':>10}{'as seat1':>10}"]
     for (a, b), rows in sorted(matchups.items()):
         results = np.array([r[0] for r in rows])
         diffs = np.array([r[1] for r in rows], dtype=float)
@@ -151,7 +151,7 @@ def summarize(records: List[Dict[str, Any]]) -> str:
             f'{a:<22}{b:<22}{len(rows):>6}'
             f'{f"{(results == 1).sum()}-{(results == 0.5).sum()}-{(results == 0).sum()}":>12}'
             f'{results.mean():>9.1%}'
-            f'{f"[{lo:.1%},{hi:.1%}]":>15}{diffs.mean():>+7.1f}{1.96 * sem:>6.1f}{diffs.min():>+7.0f}'
+            f'{f"[{lo:.1%},{hi:.1%}]":>15}{diffs.mean():>+7.1f}{1.96 * sem:>6.1f}{diffs.min():>+8.0f}{-diffs.max():>+8.0f}'
             f'{results[seat0].mean() if seat0.any() else float("nan"):>10.1%}'
             f'{results[~seat0].mean() if (~seat0).any() else float("nan"):>10.1%}'
         )
