@@ -6,7 +6,7 @@ move nor a lucky opening favors a player. Results append to games.jsonl as games
 finish, and rerunning with the same --out skips games already recorded.
 
 Player specs are name=kind[:key=value...]. Kinds:
-    random, size, space1, space2, mobility
+    random, size, space1, space2, mobility, lookahead
     raw:ckpt=PATH
     mcts:ckpt=PATH,sims=200,vs=1,batch=8,topk=50,cpuct=1.5,rootk=50,margin=auto
 
@@ -34,7 +34,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from blokus.agents.bots import (
-    GreedySizeBot, MctsBot, MobilityBot, OPENING_PLIES, RandomBot, RawPolicyBot,
+    GreedySizeBot, LookaheadBot, MctsBot, MobilityBot, OPENING_PLIES, RandomBot, RawPolicyBot,
     SpaceBot, random_opening,
 )
 from blokus.engine.game_state import GameState
@@ -54,6 +54,8 @@ def build_bot(spec: str, seed: int) -> Any:
         return SpaceBot(diagonal=True, seed=seed)
     if kind == 'mobility':
         return MobilityBot(seed=seed)
+    if kind == 'lookahead':
+        return LookaheadBot(seed=seed)
     device = torch.device('cpu')
     network, info = load_network(opts['ckpt'], device)
     if kind == 'raw':
@@ -92,21 +94,25 @@ def play_game(task: Dict[str, Any]) -> Dict[str, Any]:
 
     started = time.time()
     state = GameState.new_game('dual')
-    for action in random_opening(task['opening_seed']):
+    moves = random_opening(task['opening_seed'])
+    for action in moves:
         state = state.apply_action(action)
     plies = OPENING_PLIES
     while not state.is_terminal():
         if not state.get_legal_actions():
             state = state.pass_turn()
+            moves.append(-1)
             continue
-        state = state.apply_action(bots[state.get_current_agent()].select_action(state))
+        action = bots[state.get_current_agent()].select_action(state)
+        state = state.apply_action(action)
+        moves.append(action)
         plies += 1
 
     scores = state.get_scores()
     return {
         'key': task['key'], 'seat0': names[0], 'seat1': names[1],
         'score0': scores[0] + scores[2], 'score1': scores[1] + scores[3],
-        'opening_seed': task['opening_seed'], 'plies': plies,
+        'opening_seed': task['opening_seed'], 'plies': plies, 'moves': moves,
         'seconds': round(time.time() - started, 1),
     }
 
@@ -133,8 +139,8 @@ def summarize(records: List[Dict[str, Any]]) -> str:
         result = 1.0 if diff > 0 else (0.5 if diff == 0 else 0.0)
         matchups[(a, b)].append((result, diff, a_is_seat0))
 
-    lines = [f"{'A':<22}{'B':<22}{'games':>6}{'A score':>9}{'95% CI':>15}"
-             f"{'diff':>7}{'+/-':>6}{'as seat0':>10}{'as seat1':>10}"]
+    lines = [f"{'A':<22}{'B':<22}{'games':>6}{'W-D-L':>12}{'A score':>9}{'95% CI':>15}"
+             f"{'diff':>7}{'+/-':>6}{'worst':>7}{'as seat0':>10}{'as seat1':>10}"]
     for (a, b), rows in sorted(matchups.items()):
         results = np.array([r[0] for r in rows])
         diffs = np.array([r[1] for r in rows], dtype=float)
@@ -142,8 +148,10 @@ def summarize(records: List[Dict[str, Any]]) -> str:
         lo, hi = wilson(results.sum(), len(rows))
         sem = diffs.std(ddof=1) / math.sqrt(len(rows)) if len(rows) > 1 else float('nan')
         lines.append(
-            f'{a:<22}{b:<22}{len(rows):>6}{results.mean():>9.1%}'
-            f'{f"[{lo:.1%},{hi:.1%}]":>15}{diffs.mean():>+7.1f}{1.96 * sem:>6.1f}'
+            f'{a:<22}{b:<22}{len(rows):>6}'
+            f'{f"{(results == 1).sum()}-{(results == 0.5).sum()}-{(results == 0).sum()}":>12}'
+            f'{results.mean():>9.1%}'
+            f'{f"[{lo:.1%},{hi:.1%}]":>15}{diffs.mean():>+7.1f}{1.96 * sem:>6.1f}{diffs.min():>+7.0f}'
             f'{results[seat0].mean() if seat0.any() else float("nan"):>10.1%}'
             f'{results[~seat0].mean() if (~seat0).any() else float("nan"):>10.1%}'
         )

@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from blokus.agents.bots import GreedySizeBot, MobilityBot, RandomBot, SpaceBot
+from blokus.agents.bots import GreedySizeBot, LookaheadBot, MobilityBot, RandomBot, SpaceBot
 from blokus.engine.game_state import (
     COLOR_CORNERS, COLOR_NAMES, GameState, decode_action, encode_action, load_pieces,
 )
@@ -205,6 +205,7 @@ class TestBots:
     @pytest.mark.parametrize('make_bot', [
         lambda: RandomBot(0), lambda: GreedySizeBot(seed=0),
         lambda: SpaceBot(False, 0), lambda: SpaceBot(True, 0), lambda: MobilityBot(seed=0),
+        lambda: LookaheadBot(seed=0),
     ])
     def test_bots_only_play_legal_moves(self, make_bot):
         bot = make_bot()
