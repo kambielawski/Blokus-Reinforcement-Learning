@@ -21,5 +21,8 @@ ARGS=(--pairs-per-matchup 100 --workers "$SLURM_CPUS_PER_TASK"
 for bot in random size space1 space2 mobility lookahead; do
     ARGS+=(--player "$bot=$bot" --matchup "model_s800,$bot" --matchup "model_raw,$bot")
 done
+# Strongest fixed reference: the bots alone can't separate good from very good.
+ARGS+=(--player "imitation_s800=mcts:ckpt=$BLOKUS_SCRATCH/pretrain/imitation-5b.pt,sims=800"
+       --matchup "model_s800,imitation_s800")
 echo "Job $SLURM_JOB_ID on $(hostname), commit $(git rev-parse --short HEAD), model $CKPT"
 python -u scripts/ladder.py "${ARGS[@]}"

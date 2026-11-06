@@ -187,7 +187,8 @@ class LookaheadBot:
     """Two-ply mobility: takes the top moves by mobility and checks the best reply.
 
     Each candidate is scored as its mobility value minus the replying color's best
-    mobility value. Much stronger than one ply, and about 20 ms per move.
+    mobility value. Not clearly stronger than one ply: 61% against it (n=100, CI 51-70,
+    margin +1.1). Useful as a different style of opponent, not a harder rung.
     """
 
     def __init__(self, candidates: int = 15, size_weight: float = 2.0,
