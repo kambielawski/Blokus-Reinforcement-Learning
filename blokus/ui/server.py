@@ -9,12 +9,15 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from blokus.agents.bots import MctsBot
-from blokus.engine.game_state import BOARD_SIZE, COLOR_CORNERS, COLOR_NAMES
+from blokus.agents.bots import MctsBot, MobilityBot
+from blokus.engine.game_state import BOARD_SIZE, COLOR_CORNERS, COLOR_NAMES, RULES_VERSION
 from blokus.nn.checkpoint import load_network
 from blokus.ui.session import GameSession, IllegalMove, piece_catalog
 
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
+
+
+HEURISTIC_OPPONENT = 'mobility heuristic'
 
 
 class PlayServer:
@@ -29,14 +32,26 @@ class PlayServer:
         self.defaults = defaults
         self.session: Optional[GameSession] = None
         self._networks: Dict[str, Tuple[torch.nn.Module, Dict[str, Any]]] = {}
+        self._playable: Dict[str, bool] = {}
         self._lock = threading.Lock()
 
     def checkpoints(self) -> list:
-        """Checkpoints found under data/, as paths relative to the repo."""
+        """Opponents to offer: playable checkpoints under data/, then the heuristic."""
         pattern = os.path.join(self.repo_root, 'data', '**', 'checkpoint*.pt')
         paths = {os.path.relpath(p, self.repo_root) for p in glob.glob(pattern, recursive=True)}
-        paths.add(self.default_checkpoint)
-        return sorted(paths)
+        paths |= {os.path.relpath(p, self.repo_root) for p in glob.glob(
+            os.path.join(self.repo_root, 'data', 'pretrain', '*.pt'))}
+        if self.default_checkpoint != HEURISTIC_OPPONENT:
+            paths.add(self.default_checkpoint)
+        return [p for p in sorted(paths) if self._is_playable(p)] + [HEURISTIC_OPPONENT]
+
+    def _is_playable(self, path: str) -> bool:
+        """True if this checkpoint was trained under the current rules (cached)."""
+        if path not in self._playable:
+            ckpt = torch.load(os.path.join(self.repo_root, path), map_location='cpu',
+                              weights_only=False)
+            self._playable[path] = ckpt.get('rules_version', 1) == RULES_VERSION
+        return self._playable[path]
 
     def meta(self) -> Dict[str, Any]:
         return {
@@ -72,24 +87,27 @@ class PlayServer:
         with self._lock:
             if self.session is not None and self.session.result() is None:
                 self.session.abandon()
-            network, net_info = self._network(checkpoint)
-            bot = MctsBot(
-                network, self.device, sims=sims, c_puct=float(merged['c_puct']),
-                batch_size=int(merged['batch_size']), top_k=int(merged['top_k']),
-                value_scale=float(merged['value_scale']),
-                terminal_score_diff=bool(merged['terminal_score_diff']),
-                # Networks trained on score margin say so in their config
-                terminal_margin_scale=float(
-                    net_info['config'].get('training', {}).get('margin_scale', 0.0)),
-                time_limit=time_limit or None,
-            )
-            ai_info = {
-                'checkpoint': os.path.join(self.repo_root, checkpoint),
-                'checkpoint_name': checkpoint,
-                'iteration': net_info['iteration'],
-                'device': str(self.device),
-                **merged,
-            }
+            if checkpoint == HEURISTIC_OPPONENT:
+                bot = MobilityBot()
+                ai_info = {'name': HEURISTIC_OPPONENT, 'checkpoint_name': checkpoint}
+            else:
+                network, net_info = self._network(checkpoint)
+                bot = MctsBot(
+                    network, self.device, sims=sims, c_puct=float(merged['c_puct']),
+                    batch_size=int(merged['batch_size']), top_k=int(merged['top_k']),
+                    value_scale=float(merged['value_scale']),
+                    # Search values finished games on the scale the network trained on
+                    terminal_margin_scale=float(
+                        net_info['config'].get('training', {}).get('margin_scale', 0.0)),
+                    time_limit=time_limit or None,
+                )
+                ai_info = {
+                    'checkpoint': os.path.join(self.repo_root, checkpoint),
+                    'checkpoint_name': checkpoint,
+                    'iteration': net_info['iteration'],
+                    'device': str(self.device),
+                    **merged,
+                }
             self.session = GameSession(bot, side, self.games_dir, ai_info)
             self.session.start()
             return self.session.view()

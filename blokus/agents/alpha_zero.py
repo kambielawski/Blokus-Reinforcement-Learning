@@ -103,7 +103,6 @@ def self_play_game(network: BlokusNetwork,
                    max_moves: int = 0,
                    device: Optional[torch.device] = None,
                    top_k_actions: int = 0,
-                   score_diff_targets: bool = False,
                    use_score_input: bool = False,
                    margin_scale: float = 0.0,
                    root_top_k: Optional[int] = None,
@@ -122,10 +121,9 @@ def self_play_game(network: BlokusNetwork,
         temp_threshold: After this many moves, switch to greedy play.
         max_moves: Stop after this many moves (0 = play to completion).
         device: PyTorch device.
-        score_diff_targets: Use normalized score differential as value target.
         use_score_input: Record score vectors for score-input value head.
         margin_scale: If > 0, value target is tanh(score margin / margin_scale),
-            also used for terminal nodes in search. Overrides score_diff_targets.
+            also used for terminal nodes in search. 0 = win/loss.
         root_top_k: Children kept at the root (see MCTS).
         dirichlet_alpha: Root noise concentration.
 
@@ -188,16 +186,6 @@ def self_play_game(network: BlokusNetwork,
     if margin_scale > 0 and game_mode == 'dual':
         margin = math.tanh((scores[0] + scores[2] - scores[1] - scores[3]) / margin_scale)
         agent_values = {0: margin, 1: -margin}
-    elif score_diff_targets:
-        # Normalized score differential per agent
-        if game_mode == 'dual':
-            s0 = scores[0] + scores[2]
-            s1 = scores[1] + scores[3]
-        else:
-            s0 = scores.get(0, 0)
-            s1 = sum(scores.get(i, 0) for i in range(1, 4))
-        total = max(s0 + s1, 1)
-        agent_values = {0: (s0 - s1) / total, 1: (s1 - s0) / total}
     else:
         agent_values = state.get_rewards()
 

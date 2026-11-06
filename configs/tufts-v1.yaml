@@ -1,9 +1,9 @@
 # First Tufts run. Reasons and evidence are in the project's training plan.
-# Start from imitation weights: scripts/pretrain_imitation.py, then --init-weights.
+# Table rules. Reasons and evidence: project training plan. Weights start from imitation pretraining (--init-weights).
 
 network:
-  num_blocks: 10            # Doubled: the 5-block net is not the bottleneck yet, but
-  channels: 128             # receptive field across a 20x20 board is. See plan.
+  num_blocks: 10
+  channels: 128
 
 mcts:
   num_simulations: 400
@@ -19,9 +19,8 @@ training:
   iterations: 300
   replay_buffer_size: 300000
   value_loss_weight: 1.0    # Margin targets have variance near 0.5, not 0.003
-  score_diff_targets: false
   margin_scale: 20.0        # Value target and terminal value: tanh(margin / 20 squares)
-  mirror_augment: true
+  rotation_augment: true
   lr_schedule:
     enabled: true
     warmup_iters: 5

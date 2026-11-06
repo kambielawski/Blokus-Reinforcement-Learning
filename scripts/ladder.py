@@ -8,7 +8,7 @@ finish, and rerunning with the same --out skips games already recorded.
 Player specs are name=kind[:key=value...]. Kinds:
     random, size, space1, space2, mobility
     raw:ckpt=PATH
-    mcts:ckpt=PATH,sims=200,vs=1,batch=8,topk=50,cpuct=1.5,tsd=0,margin=0
+    mcts:ckpt=PATH,sims=200,vs=1,batch=8,topk=50,cpuct=1.5,rootk=50,margin=auto
 
 Usage:
     python scripts/ladder.py --out data/ladder/base --pairs-per-matchup 20 \\
@@ -55,20 +55,25 @@ def build_bot(spec: str, seed: int) -> Any:
     if kind == 'mobility':
         return MobilityBot(seed=seed)
     device = torch.device('cpu')
-    network, _ = load_network(opts['ckpt'], device)
+    network, info = load_network(opts['ckpt'], device)
     if kind == 'raw':
         return RawPolicyBot(network, device)
     if kind == 'mcts':
-        return MctsBot(
+        margin = opts.get('margin', 'auto')
+        if margin == 'auto':  # Search on the scale the network was trained on
+            margin = info['config'].get('training', {}).get('margin_scale', 0)
+        bot = MctsBot(
             network, device,
             sims=int(opts.get('sims', 200)),
             c_puct=float(opts.get('cpuct', 1.5)),
             batch_size=int(opts.get('batch', 8)),
             top_k=int(opts.get('topk', 50)),
             value_scale=float(opts.get('vs', 1.0)),
-            terminal_score_diff=bool(int(opts.get('tsd', 0))),
-            terminal_margin_scale=float(opts.get('margin', 0)),
+            terminal_margin_scale=float(margin),
         )
+        if 'rootk' in opts:
+            bot.mcts.root_top_k = int(opts['rootk'])
+        return bot
     raise ValueError(f'Unknown player kind: {kind}')
 
 

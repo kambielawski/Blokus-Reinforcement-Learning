@@ -9,7 +9,7 @@
 :root {
   --bg: #f4f2ee; --panel: #ffffff; --ink: #24262b; --muted: #6b6f78; --line: #d9d6cf;
   --cell: #ece9e2; --cell-line: #cfcbc2; --ok: #1a8f4c; --bad: #d43131; --accent: #2b59c3;
-  --c0: #eab308; --c1: #2563eb; --c2: #dc2626; --c3: #16a34a;
+  --c0: #2563eb; --c1: #eab308; --c2: #dc2626; --c3: #16a34a;
   --size: min(calc((100vh - 48px) / 20), calc((100vw - 620px) / 20), 36px);
   color-scheme: light;
 }
@@ -155,16 +155,16 @@ dialog footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 
   <h1>New game</h1>
   <label>Play as</label>
   <div class="sidepick">
-    <button type="button" data-side="0"><span class="swatches"><i style="background:var(--c0)"></i><i style="background:var(--c2)"></i></span>Yellow + Red<br><small>Moves first, top corners</small></button>
-    <button type="button" data-side="1"><span class="swatches"><i style="background:var(--c1)"></i><i style="background:var(--c3)"></i></span>Blue + Green<br><small>Moves second, bottom corners</small></button>
+    <button type="button" data-side="0"><span class="swatches"><i style="background:var(--c0)"></i><i style="background:var(--c2)"></i></span>Blue + Red<br><small>Moves first</small></button>
+    <button type="button" data-side="1"><span class="swatches"><i style="background:var(--c1)"></i><i style="background:var(--c3)"></i></span>Yellow + Green<br><small>Moves second</small></button>
   </div>
   <div class="row2">
     <div><label for="sims">AI simulations per move</label><input id="sims" type="number" min="1" step="50"></div>
     <div><label for="think">AI seconds per move (0 = no limit)</label><input id="think" type="number" min="0" step="1"></div>
   </div>
   <p class="note" id="speedNote"></p>
-  <p class="note">Score is squares placed, with no bonus for playing every piece. The game ends when no color can move, or as soon as any color has played all 21 pieces.</p>
-  <label for="checkpoint">Model</label>
+  <p class="note">Table rules: play runs clockwise until no color can move. Each color scores -1 per square left in hand, +15 for playing all 21 pieces, and +5 more if its last piece was the single square.</p>
+  <label for="checkpoint">Opponent</label>
   <select id="checkpoint"></select>
   <footer>
     <button type="button" id="cancelNew">Cancel</button>
@@ -475,7 +475,7 @@ function drawScores() {
     const left = state.pieces_remaining[c].reduce((n, id) => n + meta.pieces[id].size, 0);
     row.innerHTML = `<header><i class="dot" style="background:${COLOR_VAR[c]}"></i>` +
       `${meta.color_names[c]} <small style="color:var(--muted)">${mine ? 'you' : 'AI'}</small>` +
-      `<span class="num">${state.color_scores[c]} placed, ${left} left</span></header>`;
+      `<span class="num">${state.color_squares[c]} placed, ${left} left, score ${state.color_scores[c]}</span></header>`;
     const mini = document.createElement('div');
     mini.className = 'mini';
     mini.style.setProperty('--shape', COLOR_VAR[c]);

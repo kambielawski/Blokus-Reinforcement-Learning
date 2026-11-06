@@ -112,7 +112,7 @@ from blokus.engine.game_state import (
 **Key attributes** (access directly, all are public):
 - `board` — `np.ndarray` shape `(20, 20)`, dtype `int8`. Values: 0=empty, 1-4=colors.
 - `pieces_remaining` — tuple of 4 `frozenset`s, each containing remaining piece IDs (0-20) for that color.
-- `current_color` — int 0-3, which color moves next.
+- `current_color` — int 0-3, which color moves next. Order is Blue, Yellow, Red, Green.
 - `consecutive_passes` — int, how many colors have passed in a row (game ends at 4).
 - `game_mode` — `'standard'` or `'dual'`.
 - `pieces` — list of 21 `PieceInfo` objects (shared reference, never copied).
@@ -126,12 +126,13 @@ from blokus.engine.game_state import (
 | `get_legal_actions_mask()` | Binary `ndarray` of shape `(67200,)` |
 | `apply_action(action)` | Place a piece, return new state (resets passes to 0) |
 | `pass_turn()` | Skip turn, return new state (increments consecutive_passes) |
-| `is_terminal()` | True if 4 consecutive passes or any color placed all 21 pieces |
+| `is_terminal()` | True after 4 consecutive passes (no color can move) |
 | `get_current_player()` | Current color index (0-3) |
 | `get_current_agent()` | Current agent index (0-3 standard, 0-1 dual) |
 | `get_num_agents()` | 4 (standard) or 2 (dual) |
-| `get_scores()` | `{color_idx: num_squares_on_board}` |
-| `get_rewards()` | `{agent_idx: float in {-1, 0, +1}}` win/loss/draw rewards |
+| `get_scores()` | `{color_idx: rule-book score}`: -1 per unplaced square, +15 all pieces, +5 if the monomino was last |
+| `get_squares_placed()` | `{color_idx: num_squares_on_board}` |
+| `get_rewards()` | `{agent_idx: float in {-1, 0, +1}}` win/loss/draw from rule-book scores |
 | `get_nn_state()` | `(5, 20, 20)` float32 tensor for NN input |
 | `render_text()` | ASCII board string |
 | `render_image(cell_size=24)` | RGB `(H, W, 3)` uint8 numpy array |
@@ -141,7 +142,7 @@ from blokus.engine.game_state import (
 
 **Standard (1v1v1v1):** 4 agents, agent `i` controls color `i`. `get_current_agent() == get_current_player()`.
 
-**Dual (1v1):** 2 agents. Agent 0 controls colors 0 and 2; Agent 1 controls colors 1 and 3. Turn order still cycles 0→1→2→3. `get_current_agent() == current_color % 2`. Rewards combine both colors per agent.
+**Dual (1v1):** 2 agents. Agent 0 controls Blue and Red (top-left, bottom-right); Agent 1 controls Yellow and Green (top-right, bottom-left). Turn order cycles 0→1→2→3, clockwise around the board. `get_current_agent() == current_color % 2`. Rewards combine both colors per agent.
 
 Both modes use the same 20x20 board with 4 colors and 21 pieces per color.
 
@@ -198,25 +199,28 @@ The representation is always from the perspective of the player to move. This me
 - Board is a `(20, 20)` numpy array, dtype `int8`.
 - Value 0 = empty. Values 1-4 = the four colors.
 - Color index `i` (0-based, used in GameState) maps to board value `i + 1`.
-- Corner assignments: color 0 = (0,0), color 1 = (19,19), color 2 = (0,19), color 3 = (19,0).
-- Color names: 0=Yellow, 1=Blue, 2=Red, 3=Green.
+- Corner assignments, clockwise: color 0 = (0,0), color 1 = (0,19), color 2 = (19,19), color 3 = (19,0).
+- Color names: 0=Blue, 1=Yellow, 2=Red, 3=Green.
 
 ### Rendering
 
-- `render_text()` — ASCII art with `.` for empty, `Y`/`B`/`R`/`G` for colors.
+- `render_text()` — ASCII art with `.` for empty, `B`/`Y`/`R`/`G` for colors.
 - `render_image(cell_size=24)` — RGB numpy array suitable for PIL/matplotlib display or video creation.
 - `scripts/generate_video.py` — Uses `render_image()` + PIL to generate animated GIFs frame by frame.
 - Legacy rendering (in `blokus/engine/board.py`): `display_pygame()`, `display2()` (seaborn), `display()` (print numpy).
 
 ## Blokus Rules Reference
 
+From the Mattel rule sheets R1983-0920 and BJV44-0920 (service.mattel.com/instruction_sheets), using their advanced scoring:
+
 1. **Board**: 20x20 grid, 4 colors.
 2. **Pieces**: 21 polyominoes per color (1 monomino, 1 domino, 2 triominoes, 5 tetrominoes, 12 pentominoes = 89 total squares).
-3. **First move**: Must cover the player's assigned corner cell.
-4. **Subsequent moves**: At least one cell of the new piece must be **diagonally adjacent** to an existing same-color cell. No cell may be **orthogonally adjacent** to same-color. No overlap with any color.
-5. **Passing**: If a color has no legal moves, it passes. A color that passes may become able to play again later (if other players' moves open new adjacencies — though this is rare in practice).
-6. **Game end**: All 4 colors pass consecutively, or any color places all 21 pieces.
-7. **Scoring**: Number of squares placed on the board per color (max 89 per color).
+3. **Order of play**: Blue, Yellow, Red, Green, clockwise. Two players: one has Blue and Red, the other Yellow and Green.
+4. **First move**: Must cover a corner. The sheets don't tie colors to corners; the engine gives each color a fixed corner in clockwise order.
+5. **Subsequent moves**: At least one cell of the new piece must be **diagonally adjacent** to an existing same-color cell. No cell may be **orthogonally adjacent** to same-color. No overlap with any color.
+6. **Passing**: A color that cannot place passes. It can never move again, since only its own pieces create new places to play.
+7. **Game end**: When no color can place a piece. Placing all 21 does not end the game.
+8. **Scoring**: -1 per square in remaining pieces, +15 for placing all 21, and +5 more if the last piece placed was the monomino. A two-player score is the sum of both colors.
 
 ## Development Conventions
 
@@ -260,7 +264,7 @@ The representation is always from the perspective of the player to move. This me
 **Architecture:**
 - Initial conv: 5 → 128 filters (3×3), batch norm, ReLU
 - 5 residual blocks (configurable): each = two 3×3 convs with batch norm + skip connection
-- **Policy head (convolutional):** 128 → 168 (1×1) conv + batch norm + piece-remaining bias (84 → 168 FC, broadcast over spatial dims) + ReLU → flatten to 67,200 logits → masked log-softmax
+- **Policy head (convolutional):** 128 → 168 (1×1) conv + batch norm + piece-remaining bias (84 → 168 FC, broadcast over spatial dims) → flatten to 67,200 logits → masked log-softmax
 - **Value head:** 128 → 1 (1×1) conv + batch norm + ReLU → flatten + concat piece-remaining → FC(484, 256) → ReLU → FC(256, 1) → tanh
 
 **Key function:** `make_pieces_remaining_vector(state)` builds the 84-dim binary vector (21 pieces × 4 colors in turn order).
@@ -345,12 +349,9 @@ reports win rate with Wilson 95% CIs and score margin. Results append to
 checkpoint. Win rate against random says almost nothing: see the mobility results in
 the project progress log.
 
-### Action encoding versions
+### Rules versions
 
-Action indices changed meaning once. Version 2 normalized four orientations of pieces
-18-20 to (0, 0), making 91 previously unreachable placements legal. New checkpoints
-record `action_encoding: 2`. Older ones load with `legacy_action_encoding=True`, which
-shifts those policy channels. Do not reuse a pre-v2 replay buffer in training.
+`RULES_VERSION` in `game_state.py` stamps every checkpoint. Version 2 is table rules. `load_network` and `--resume` reject anything else. Version 1 checkpoints (including scale-v2 iter 649) only run at git tag `old-rules-final`, and configs written before then (`scale-v*`, `exp-*`, `full`, `small`) describe those runs. Strength numbers from before 2026-11-05 are old-rules.
 
 ## Development Roadmap
 

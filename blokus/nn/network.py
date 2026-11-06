@@ -33,15 +33,6 @@ PIECE_REMAINING_SIZE = NUM_PIECES * NUM_COLORS  # 84
 SCORE_VECTOR_SIZE = NUM_COLORS  # 4
 MAX_SCORE_PER_COLOR = 89  # 21 pieces = 89 total squares
 
-# Policy channels whose actions moved in action encoding 2, as
-# (channel, row shift, col shift). A version 1 logit at (r, c) means the same
-# placement as the version 2 action at (r + row shift, c + col shift).
-LEGACY_POLICY_SHIFTS = (
-    (18 * MAX_ORIENTATIONS + 0, 0, 1),
-    (19 * MAX_ORIENTATIONS + 0, 1, 1),
-    (20 * MAX_ORIENTATIONS + 0, 1, 0),
-    (20 * MAX_ORIENTATIONS + 2, 0, 1),
-)
 
 
 class ResidualBlock(nn.Module):
@@ -78,9 +69,6 @@ class BlokusNetwork(nn.Module):
         self.num_blocks = num_blocks
         self.channels = channels
         self.score_input = score_input
-        # True for weights trained on action encoding 1 (set by load_network).
-        # Placements that encoding could not express get the lowest logit.
-        self.legacy_action_encoding = False
 
         # --- Backbone ---
         self.input_conv = nn.Conv2d(INPUT_CHANNELS, channels, 3, padding=1, bias=False)
@@ -138,13 +126,6 @@ class BlokusNetwork(nn.Module):
         # Add piece-remaining bias: project 84 → 168, broadcast over spatial dims
         piece_bias = self.policy_pieces_fc(pieces_remaining)  # (batch, 168)
         p = p + piece_bias.unsqueeze(-1).unsqueeze(-1)  # broadcast to (batch, 168, 20, 20)
-        p = F.relu(p)
-        if self.legacy_action_encoding:
-            for channel, row_shift, col_shift in LEGACY_POLICY_SHIFTS:
-                shifted = torch.zeros_like(p[:, channel])
-                shifted[:, row_shift:, col_shift:] = \
-                    p[:, channel, :BOARD_SIZE - row_shift, :BOARD_SIZE - col_shift]
-                p[:, channel] = shifted
         p = p.view(p.size(0), -1)  # (batch, 67200)
 
         # Mask illegal actions with large negative value, then log-softmax
@@ -192,7 +173,7 @@ def make_score_vector(state) -> np.ndarray:
 
     Returns: (4,) float32 numpy array.
     """
-    scores = state.get_scores()
+    scores = state.get_squares_placed()
     vec = np.zeros(SCORE_VECTOR_SIZE, dtype=np.float32)
     current = state.current_color
     for i in range(NUM_COLORS):

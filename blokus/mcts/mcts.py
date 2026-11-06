@@ -88,12 +88,9 @@ class MCTS:
         value_scale: Multiplier on network values before they enter Q, clamped
             to [-1, 1]. Score-diff networks predict values around +/-0.05, far
             below the PUCT exploration term, so 1.0 leaves search following the
-            prior. Terminal rewards are unaffected unless terminal_score_diff.
-        terminal_score_diff: Value terminal nodes by the score differential on
-            the same scale as the network (dual mode), not as +/-1 win/loss.
+            prior.
         terminal_margin_scale: If > 0, value terminal nodes as
             tanh(score margin / scale), matching networks trained on that target.
-            Takes precedence over terminal_score_diff.
         root_top_k: Children kept at the root (0 = all legal moves, None = same
             as top_k_actions). Pruning the root by prior stops self-play from ever
             finding a good move the policy currently ranks low.
@@ -110,7 +107,6 @@ class MCTS:
                  batch_size: int = 8,
                  top_k_actions: int = 0,
                  value_scale: float = 1.0,
-                 terminal_score_diff: bool = False,
                  terminal_margin_scale: float = 0.0,
                  root_top_k: Optional[int] = None,
                  time_limit: Optional[float] = None):
@@ -124,7 +120,6 @@ class MCTS:
         self.batch_size = batch_size
         self.top_k_actions = top_k_actions
         self.value_scale = value_scale
-        self.terminal_score_diff = terminal_score_diff
         self.terminal_margin_scale = terminal_margin_scale
         self.root_top_k = root_top_k
         self.time_limit = time_limit
@@ -182,13 +177,11 @@ class MCTS:
             return -1, policy, value
 
         if self.temperature < 0.01:
-            # Greedy: pick highest visit count
-            action = legal[0]
-            best_count = 0.0
-            for a in legal:
-                if policy[a] > best_count:
-                    best_count = policy[a]
-                    action = a
+            # Greedy: most visits, ties to the better Q. Children are stored in
+            # shuffled order, so remaining ties don't favor any piece.
+            children = self.last_stats['children']
+            action = max((a for a in children if a >= 0),
+                         key=lambda a: (children[a][0], children[a][1]))
         else:
             # Sample proportional to visit counts raised to 1/temperature
             probs = np.zeros(len(legal), dtype=np.float64)
@@ -208,12 +201,9 @@ class MCTS:
 
     def _run_single_sim(self, root: MCTSNode) -> None:
         """Run one MCTS simulation: select → expand → backup."""
-        node = root
-        while node.is_expanded and not node.is_terminal:
-            node = self._select_child(node)
+        node = self._descend(root)
 
         if not node.is_terminal:
-            node.ensure_state()
             value = self._expand_single(node)
         else:
             value = self._terminal_value(node)
@@ -240,10 +230,8 @@ class MCTS:
         terminal_leaves: List[Tuple[MCTSNode, float]] = []
 
         for _ in range(batch_target):
-            node = root
             # Selection with virtual loss applied to previously selected paths
-            while node.is_expanded and not node.is_terminal:
-                node = self._select_child(node)
+            node = self._descend(root)
 
             if node.is_terminal:
                 value = self._terminal_value(node)
@@ -252,7 +240,6 @@ class MCTS:
                 node.visit_count += 1
                 node.total_value += self._virtual_loss
             else:
-                node.ensure_state()
                 leaves.append(node)
                 # Apply virtual loss to discourage re-selecting this path
                 self._apply_virtual_loss(node)
@@ -296,6 +283,26 @@ class MCTS:
     # ------------------------------------------------------------------
     # Tree operations
     # ------------------------------------------------------------------
+
+    def _descend(self, root: MCTSNode) -> MCTSNode:
+        """Walk from the root to the leaf this simulation will evaluate.
+
+        Forced passes cost nothing: a color with no moves gets its single pass child
+        without using a simulation or a network call. Late in a game most turns are
+        passes, and otherwise they would use up the search budget.
+        """
+        node = root
+        while True:
+            node.ensure_state()
+            if node.is_terminal:
+                return node
+            if not node.is_expanded:
+                if node.state.get_legal_actions():
+                    return node
+                node.children[-1] = MCTSNode(node.state.pass_turn(), parent=node,
+                                             action=-1, prior=1.0)
+                node.is_expanded = True
+            node = self._select_child(node)
 
     def _select_child(self, node: MCTSNode) -> MCTSNode:
         """Select child with highest PUCT score."""
@@ -420,8 +427,11 @@ class MCTS:
             eps = self.dirichlet_epsilon
             priors = (1 - eps) * priors + eps * noise
 
-        # Create children lazily (no apply_action yet)
-        for i, a in enumerate(legal):
+        # Create children lazily (no apply_action yet). Legal moves arrive sorted by
+        # piece id, smallest first, and selection keeps the first of equal scores, so
+        # without shuffling every tie would favor small pieces.
+        for i in np.random.permutation(len(legal)):
+            a = legal[i]
             child = MCTSNode(
                 state=None,  # lazy — created on first visit
                 parent=node,
@@ -510,12 +520,6 @@ class MCTS:
             margin = scores[0] + scores[2] - scores[1] - scores[3]
             value = math.tanh(margin / self.terminal_margin_scale)
             return value if agent == 0 else -value
-        if self.terminal_score_diff and state.game_mode == 'dual':
-            scores = state.get_scores()
-            s0, s1 = scores[0] + scores[2], scores[1] + scores[3]
-            diff = (s0 - s1) / max(s0 + s1, 1)
-            scaled = max(-1.0, min(1.0, diff * self.value_scale))
-            return scaled if agent == 0 else -scaled
         rewards = state.get_rewards()
         return rewards.get(agent, 0.0)
 

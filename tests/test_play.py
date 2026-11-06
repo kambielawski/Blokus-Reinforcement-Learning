@@ -9,9 +9,9 @@ import torch
 
 from blokus.agents.bots import GreedySizeBot, MobilityBot, RandomBot, SpaceBot
 from blokus.engine.game_state import (
-    COLOR_CORNERS, GameState, decode_action, encode_action, load_pieces,
+    COLOR_CORNERS, COLOR_NAMES, GameState, decode_action, encode_action, load_pieces,
 )
-from blokus.nn.network import BlokusNetwork, LEGACY_POLICY_SHIFTS
+from blokus.nn.network import BlokusNetwork
 from blokus.ui.session import (
     GameSession, IllegalMove, explain_illegal, piece_catalog,
 )
@@ -56,29 +56,6 @@ class TestPieceNormalization:
     def test_square_reaches_top_left_cell(self):
         state = GameState.new_game('dual')
         assert encode_action(19, 0, 0, 0) in state.get_legal_actions()
-
-    def test_legacy_policy_shift_targets_the_same_placement(self):
-        """A version 1 logit at (r, c) must land on the new action covering the same cells."""
-        torch.manual_seed(0)
-        network = BlokusNetwork(num_blocks=1, channels=8)
-        network.eval()
-        state = play_random_plies(12, seed=1)
-        board = torch.from_numpy(state.get_nn_state()).unsqueeze(0)
-        pieces = torch.rand(1, 84)
-        mask = torch.ones(1, 67200)
-        with torch.no_grad():
-            plain, _ = network(board, pieces, mask)
-            network.legacy_action_encoding = True
-            legacy, _ = network(board, pieces, mask)
-        plain = plain[0].reshape(168, 20, 20)
-        legacy = legacy[0].reshape(168, 20, 20)
-        # Renormalization adds one constant to all log-probabilities, so compare
-        # after removing it. The I1 channel does not move, which measures it.
-        constant = (legacy[0] - plain[0]).mean()
-        assert torch.allclose(legacy[0] - constant, plain[0], atol=1e-4)
-        for channel, dr, dc in LEGACY_POLICY_SHIFTS:
-            assert torch.allclose(legacy[channel, dr:, dc:] - constant,
-                                  plain[channel, :20 - dr, :20 - dc], atol=1e-4)
 
 
 class TestPieceCatalog:
@@ -201,17 +178,16 @@ class TestGameSession:
     def test_passes_are_automatic_for_both_sides(self, tmp_path):
         """A color with no moves passes without waiting on anyone."""
         session = GameSession(RandomBot(0), 0, str(tmp_path))
-        state = play_random_plies(70, seed=3)
-        while state.get_legal_actions() or state.get_current_agent() != 0:
-            if state.is_terminal():
-                pytest.skip('No stuck human color in this random game')
-            legal = state.get_legal_actions()
-            state = state.apply_action(legal[0]) if legal else state.pass_turn()
-        session.state = state
+        # Blue (the human) has placed everything, so it can only pass; Yellow can still move
+        fresh = GameState.new_game('dual')
+        all_ids = frozenset(range(21))
+        session.state = GameState(fresh.board, (frozenset(), all_ids, frozenset(), frozenset()),
+                                  0, 0, 'dual', fresh.pieces, (True, False, True, True))
         session.start()
         wait_until_idle(session)
         moves = session.view()['moves']
-        assert moves and moves[0]['type'] == 'pass' and moves[0]['actor'] == 'human'
+        assert moves[0]['type'] == 'pass' and moves[0]['actor'] == 'human'
+        assert moves[1]['type'] == 'place' and moves[1]['actor'] == 'ai'
 
     def test_abandon_is_recorded_and_discards_pending_ai_move(self, tmp_path):
         session = GameSession(RandomBot(0), 1, str(tmp_path))
@@ -248,28 +224,151 @@ class TestBots:
         assert state.pieces[decode_action(action)[0]].num_cells == 5
 
 
-class TestMirrorSymmetry:
+class TestRotationSymmetry:
     @pytest.mark.parametrize('plies', [0, 1, 2, 7, 20, 35, 50])
-    def test_mirror_preserves_legal_moves_and_network_input(self, plies):
-        from blokus.engine.symmetry import mirror_action_table, mirror_state
+    @pytest.mark.parametrize('k', [1, 2, 3])
+    def test_rotation_preserves_legal_moves_and_network_input(self, plies, k):
+        from blokus.engine.symmetry import rotate_state, rotation_action_tables
         from blokus.nn.network import make_pieces_remaining_vector
         state = play_random_plies(plies, seed=plies + 100)
-        mirrored = mirror_state(state)
-        table = mirror_action_table()
-        assert {int(table[a]) for a in state.get_legal_actions()} == set(mirrored.get_legal_actions())
-        assert np.array_equal(state.get_nn_state()[:, :, ::-1], mirrored.get_nn_state())
+        turned = rotate_state(state, k)
+        table = rotation_action_tables()[k]
+        assert {int(table[a]) for a in state.get_legal_actions()} == set(turned.get_legal_actions())
+        assert np.array_equal(np.rot90(state.get_nn_state(), k=-k, axes=(1, 2)), turned.get_nn_state())
         assert np.array_equal(make_pieces_remaining_vector(state),
-                              make_pieces_remaining_vector(mirrored))
-        assert state.get_scores()[0] == mirrored.get_scores()[2]
+                              make_pieces_remaining_vector(turned))
+        scores, turned_scores = state.get_scores(), turned.get_scores()
+        assert all(scores[c] == turned_scores[(c + k) % 4] for c in range(4))
 
-    def test_mirror_of_action_covers_mirrored_cells(self):
-        from blokus.engine.symmetry import mirror_action_table
-        table = mirror_action_table()
+    def test_torch_rotation_matches_state_rotation(self):
+        """The training augmentation must turn tensors the same way as the action tables."""
+        from blokus.engine.symmetry import rotate_state
+        state = play_random_plies(20, seed=5)
+        for k in range(1, 4):
+            tensor = torch.from_numpy(state.get_nn_state())
+            turned = torch.rot90(tensor, k=-k, dims=(-2, -1)).numpy()
+            assert np.array_equal(turned, rotate_state(state, k).get_nn_state())
+
+    def test_rotated_action_covers_rotated_cells(self):
+        from blokus.engine.symmetry import rotation_action_tables
+        tables = rotation_action_tables()
         pieces = load_pieces()
-        for action in np.nonzero(table >= 0)[0][::97]:
+        for action in np.nonzero(tables[1] >= 0)[0][::97]:
             p, o, r, c = decode_action(int(action))
-            p2, o2, r2, c2 = decode_action(int(table[action]))
+            p2, o2, r2, c2 = decode_action(int(tables[1][action]))
             assert p == p2
-            cells = {(x + r, 19 - (y + c)) for x, y in pieces[p].orientations[o].occupied}
+            cells = {(y + c, 19 - (x + r)) for x, y in pieces[p].orientations[o].occupied}
             assert cells == {(x + r2, y + c2) for x, y in pieces[p2].orientations[o2].occupied}
-            assert table[table[action]] == action
+            assert tables[3][tables[1][action]] == action
+            assert tables[0][action] == action
+
+
+class TestTableRules:
+    """Examples are from the Mattel rule sheets R1983-0920 and BJV44-0920."""
+
+    def test_colors_run_clockwise_from_top_left(self):
+        assert [COLOR_NAMES[c] for c in range(4)] == ['Blue', 'Yellow', 'Red', 'Green']
+        assert [COLOR_CORNERS[c] for c in range(4)] == [(0, 0), (0, 19), (19, 19), (19, 0)]
+
+    def test_each_player_holds_opposite_corners(self):
+        state = GameState.new_game('dual')
+        agents = [state.get_current_agent()]
+        for _ in range(3):
+            state = state.pass_turn()
+            agents.append(state.get_current_agent())
+        assert agents == [0, 1, 0, 1]  # Blue and Red, then Yellow and Green
+
+    def _finished_color(self, last_piece: int) -> GameState:
+        """Blue has placed every piece, with last_piece played last; nothing else moved."""
+        state = GameState.new_game('dual')
+        remaining = (frozenset(), frozenset(range(21)), frozenset(range(21)), frozenset(range(21)))
+        return GameState(state.board, remaining, 0, 0, 'dual', state.pieces,
+                         (True, False, False, False), (last_piece, None, None, None))
+
+    def test_score_all_pieces_with_monomino_last(self):
+        assert self._finished_color(0).get_scores()[0] == 20  # Sheet example: blue +20
+
+    def test_score_all_pieces_other_last(self):
+        assert self._finished_color(4).get_scores()[0] == 15
+
+    def test_score_counts_remaining_squares(self):
+        """Sheet example: green left 1 three-square, 3 four-square and 1 five-square: -20."""
+        state = GameState.new_game('dual')
+        left = frozenset({2, 3, 6, 18, 4})  # I3, I4, L4, T4, I5
+        remaining = (frozenset(range(21)), frozenset(range(21)), frozenset(range(21)), left)
+        scored = GameState(state.board, remaining, 0, 0, 'dual', state.pieces,
+                           (False, False, False, True))
+        assert scored.get_scores()[3] == -20
+        assert scored.get_scores()[0] == -89
+
+    def test_placing_all_pieces_does_not_end_the_game(self):
+        state = self._finished_color(0)
+        assert not state.is_terminal()
+        assert state.get_legal_actions() == []  # Blue only passes now
+        state = state.pass_turn()
+        assert not state.is_terminal()
+
+    def test_game_ends_only_after_all_four_pass(self):
+        state = GameState.new_game('dual')
+        for expected in (False, False, False, True):
+            state = state.pass_turn()
+            assert state.is_terminal() == expected
+
+    def test_two_player_score_sums_both_colors(self):
+        state = play_random_plies(100, seed=1)
+        scores = state.get_scores()
+        rewards = state.get_rewards()
+        a, b = scores[0] + scores[2], scores[1] + scores[3]
+        assert rewards[0] == np.sign(a - b)
+
+    def test_last_piece_tracked_through_play(self):
+        state = GameState.new_game('dual').apply_action(encode_action(0, 0, 0, 0))
+        assert state._last_piece[0] == 0
+        for _ in range(3):
+            state = state.pass_turn()
+        assert state._last_piece[0] == 0
+        assert state.copy()._last_piece[0] == 0
+
+    def test_old_rules_checkpoint_is_rejected(self, tmp_path):
+        from blokus.nn.checkpoint import load_network
+        path = tmp_path / 'old.pt'
+        torch.save({'model_state_dict': {}, 'config': {}}, path)
+        with pytest.raises(ValueError, match='old-rules-final'):
+            load_network(str(path), torch.device('cpu'))
+
+
+class TestSearchUnderTableRules:
+    def test_forced_passes_use_no_simulations(self):
+        """Once only one color can move, every simulation reaches a real decision."""
+        from blokus.mcts.mcts import MCTS, MCTSNode
+        calls = []
+
+        class CountingNet(BlokusNetwork):
+            def forward(self, *args, **kwargs):
+                calls.append(args[0].shape[0])
+                return super().forward(*args, **kwargs)
+
+        network = CountingNet(num_blocks=1, channels=8)
+        state = GameState.new_game('dual')
+        # Yellow, Red and Green have no pieces, so only Blue moves. Each Blue move is
+        # followed by three forced passes.
+        no_pieces = frozenset()
+        state = GameState(state.board, (frozenset(range(21)), no_pieces, no_pieces, no_pieces),
+                          0, 0, 'dual', state.pieces, (False, True, True, True))
+        mcts = MCTS(network, num_simulations=8, dirichlet_alpha=0.0, batch_size=1)
+        mcts.search(state)
+        assert sum(calls) == 9  # Root plus one leaf per simulation, none spent on passes
+
+    def test_terminal_value_uses_margin_scale(self):
+        from blokus.mcts.mcts import MCTS, MCTSNode
+        state = GameState.new_game('dual')
+        for _ in range(4):
+            state = state.pass_turn()
+        finished = GameState(state.board, (frozenset(), frozenset(range(21)), frozenset(range(21)),
+                                           frozenset(range(21))), 0, 4, 'dual', state.pieces,
+                             (True, False, False, False), (0, None, None, None))
+        network = BlokusNetwork(num_blocks=1, channels=8)
+        mcts = MCTS(network, terminal_margin_scale=20.0)
+        node = MCTSNode(finished)
+        margin = (20 - 89) - (-89 - 89)
+        assert mcts._terminal_value(node) == pytest.approx(np.tanh(margin / 20))

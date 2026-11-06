@@ -15,8 +15,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from blokus.engine.game_state import (
-    ACTION_ENCODING_VERSION, BOARD_SIZE, COLOR_CORNERS, COLOR_NAMES, GameState,
-    NUM_COLORS, NUM_PIECES, decode_action, encode_action, load_pieces,
+    BOARD_SIZE, COLOR_CORNERS, COLOR_NAMES, GameState,
+    NUM_COLORS, NUM_PIECES, RULES_VERSION, decode_action, encode_action, load_pieces,
 )
 
 PIECE_NAMES = ('I1', 'I2', 'I3', 'I4', 'I5', 'V3', 'L4', 'L5', 'V5', 'W', 'Z5',
@@ -84,7 +84,7 @@ class GameSession:
 
     Args:
         bot: Object with select_action(state). May expose last_stats (see MCTS).
-        human_agent: 0 plays Yellow and Red and moves first; 1 plays Blue and Green.
+        human_agent: 0 plays Blue and Red and moves first; 1 plays Yellow and Green.
         games_dir: Where the JSON move record is written.
         ai_info: Description of the AI for the record. If it has a 'checkpoint'
             path, the file's hash is recorded too.
@@ -242,6 +242,7 @@ class GameSession:
             'ai_score': ai,
             'margin': human - ai,
             'color_scores': [self.state.get_scores()[c] for c in range(NUM_COLORS)],
+            'color_squares': [self.state.get_squares_placed()[c] for c in range(NUM_COLORS)],
         }
 
     def _status(self) -> str:
@@ -259,7 +260,7 @@ class GameSession:
             'updated_at': datetime.now(timezone.utc).isoformat(),
             'status': self._status(),
             'mode': 'dual',
-            'action_encoding': ACTION_ENCODING_VERSION,
+            'rules_version': RULES_VERSION,
             'human_agent': self.human_agent,
             'human_colors': [COLOR_NAMES[c] for c in range(NUM_COLORS)
                              if c % 2 == self.human_agent],
@@ -294,6 +295,7 @@ class GameSession:
                 'legal': legal,
                 'pieces_remaining': [sorted(state.pieces_remaining[c]) for c in range(NUM_COLORS)],
                 'color_scores': [state.get_scores()[c] for c in range(NUM_COLORS)],
+                'color_squares': [state.get_squares_placed()[c] for c in range(NUM_COLORS)],
                 'agent_scores': _agent_scores(state),
                 'moves': self.moves,
                 'result': self.result(),

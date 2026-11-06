@@ -40,9 +40,9 @@ sys.path.insert(0, REPO_ROOT)
 from blokus.nn.network import BlokusNetwork, make_pieces_remaining_vector, make_score_vector
 from blokus.agents.alpha_zero import self_play_game, TrainingExample
 from blokus.agents.bots import MctsBot, MobilityBot, random_opening
-from blokus.engine.symmetry import mirror_action_table
+from blokus.engine.symmetry import rotation_action_tables
 from blokus.nn.checkpoint import load_network
-from blokus.engine.game_state import GameState, ACTION_SPACE_SIZE, ACTION_ENCODING_VERSION
+from blokus.engine.game_state import GameState, ACTION_SPACE_SIZE, RULES_VERSION
 from blokus.mcts.mcts import MCTS
 
 
@@ -99,7 +99,6 @@ def apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> None:
         'buffer_size':     ('training', 'replay_buffer_size'),
         'value_loss_weight': ('training', 'value_loss_weight'),
         'value_dropout':     ('training', 'value_dropout'),
-        'score_diff_targets': ('training', 'score_diff_targets'),
         'score_input':       ('training', 'score_input'),
         'eval_interval':     ('eval', 'interval'),
     }
@@ -161,7 +160,7 @@ class CheckpointManager:
             'model_state_dict': network.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'config': cfg,
-            'action_encoding': ACTION_ENCODING_VERSION,
+            'rules_version': RULES_VERSION,
             **meta,
         }
 
@@ -240,7 +239,7 @@ class CheckpointManager:
                 'model_state_dict': network.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'config': cfg,
-                'action_encoding': ACTION_ENCODING_VERSION,
+                'rules_version': RULES_VERSION,
                 **meta_clean,
             }
             _atomic_torch_save(payload, best_ckpt_path)
@@ -389,12 +388,12 @@ class ReplayBuffer:
         return legal_mask, policy_target
 
     def reconstruct_sparse_batch(self, indices: np.ndarray,
-                                 mirror: Optional[np.ndarray] = None):
+                                 rotations: Optional[np.ndarray] = None):
         """Reconstruct dense legal_masks and policy_targets for a mini-batch.
 
         Args:
             indices: 1D array of example indices (int).
-            mirror: Optional bool array; examples marked True get mirrored actions.
+            rotations: Optional array of quarter turns to apply to each example.
 
         Returns:
             (legal_masks, policy_targets) as numpy arrays of shape
@@ -405,8 +404,8 @@ class ReplayBuffer:
         policy_targets = np.zeros((n, self._ACTION_SIZE), dtype=np.float32)
         for i, idx in enumerate(indices):
             li = self._legal_indices[idx]
-            if mirror is not None and mirror[i]:
-                li = mirror_action_table()[li]
+            if rotations is not None:
+                li = rotation_action_tables()[rotations[i]][li]
             legal_masks[i, li] = 1.0
             policy_targets[i, li] = self._policy_values[idx]
         return legal_masks, policy_targets
@@ -588,7 +587,6 @@ def _self_play_worker(rank: int, model_state_dict: dict, config: dict,
             max_moves=config['max_moves'],
             device=device,
             top_k_actions=config.get('top_k_actions', 0),
-            score_diff_targets=config.get('score_diff_targets', False),
             use_score_input=config.get('score_input', False),
             margin_scale=config.get('margin_scale', 0.0),
             root_top_k=config.get('root_top_k'),
@@ -651,7 +649,6 @@ def run_self_play_sequential(network: BlokusNetwork, num_games: int,
             max_moves=cfg['self_play']['max_moves'],
             device=device,
             top_k_actions=cfg['mcts'].get('top_k_actions', 0),
-            score_diff_targets=cfg['training'].get('score_diff_targets', False),
             use_score_input=cfg['training'].get('score_input', False),
             margin_scale=cfg['training'].get('margin_scale', 0.0),
             root_top_k=cfg['mcts'].get('root_top_k'),
@@ -674,7 +671,7 @@ def train_on_examples(network: BlokusNetwork,
                       epochs: int = 5,
                       value_loss_weight: float = 1.0,
                       device: torch.device = torch.device('cpu'),
-                      mirror_augment: bool = False,
+                      rotation_augment: bool = False,
                       ) -> dict:
     """Train the network on replay buffer contents.
 
@@ -682,7 +679,7 @@ def train_on_examples(network: BlokusNetwork,
 
     A fractional `epochs` trains on that share of the buffer, chosen at random,
     so the number of times each example is reused can be set directly.
-    With mirror_augment, each sample is left-right mirrored with probability 1/2.
+    With rotation_augment, each sample gets a random board rotation.
 
     Dense columns (board, pieces, value) are zero-copy CPU tensor views.
     Sparse columns (legal_mask, policy_target) are reconstructed per
@@ -707,16 +704,17 @@ def train_on_examples(network: BlokusNetwork,
         for i in range(0, samples, batch_size):
             end = min(i + batch_size, samples)
             idx = perm[i:end]
-            mirror = None
-            if mirror_augment:
-                mirror = np.random.random(len(idx)) < 0.5
+            rotations = None
+            if rotation_augment:
+                rotations = np.random.randint(0, 4, size=len(idx))
 
             # Dense columns — move to device
             bs = board_states[idx]
-            if mirror is not None:
+            if rotations is not None:
                 bs = bs.clone()
-                flip = torch.from_numpy(mirror)
-                bs[flip] = torch.flip(bs[flip], dims=[-1])
+                for k in range(1, 4):
+                    chosen = torch.from_numpy(rotations == k)
+                    bs[chosen] = torch.rot90(bs[chosen], k=-k, dims=(-2, -1))
             bs = bs.to(device, non_blocking=True)
             pv = pieces_vecs[idx].to(device, non_blocking=True)
             vt = value_targets[idx].to(device, non_blocking=True)
@@ -725,7 +723,7 @@ def train_on_examples(network: BlokusNetwork,
                 sv = score_vectors[idx].to(device, non_blocking=True)
 
             # Sparse → dense reconstruction for this mini-batch
-            lm_np, pt_np = replay_buffer.reconstruct_sparse_batch(idx.numpy(), mirror)
+            lm_np, pt_np = replay_buffer.reconstruct_sparse_batch(idx.numpy(), rotations)
             lm = torch.from_numpy(lm_np).to(device, non_blocking=True)
             pt = torch.from_numpy(pt_np).to(device, non_blocking=True)
 
@@ -1004,7 +1002,6 @@ def main():
     parser.add_argument('--buffer-size', type=int, default=None, dest='buffer_size')
     parser.add_argument('--value-loss-weight', type=float, default=None, dest='value_loss_weight')
     parser.add_argument('--value-dropout', type=float, default=None, dest='value_dropout')
-    parser.add_argument('--score-diff-targets', action='store_true', default=None, dest='score_diff_targets')
     parser.add_argument('--score-input', action='store_true', default=None, dest='score_input')
     parser.add_argument('--eval-interval', type=int, default=None, dest='eval_interval')
     parser.add_argument('--target-iteration', type=int, default=None,
@@ -1035,7 +1032,6 @@ def main():
 
     # Read experimental flags
     value_dropout = cfg['training'].get('value_dropout', 0.0) or 0.0
-    score_diff_targets = cfg['training'].get('score_diff_targets', False) or False
     score_input = cfg['training'].get('score_input', False) or False
 
     # Create network
@@ -1087,6 +1083,9 @@ def main():
             ckpt = ckpt_mgr.load(args.resume, device)
 
         if ckpt:
+            if ckpt.get('rules_version', 1) != RULES_VERSION:
+                sys.exit(f"Cannot resume: checkpoint uses rules version "
+                         f"{ckpt.get('rules_version', 1)}, engine plays {RULES_VERSION}.")
             # Handle mismatched FC layer sizes (e.g. resuming non-score-input
             # checkpoint into score-input network)
             model_sd = network.state_dict()
@@ -1148,10 +1147,7 @@ def main():
             print("No checkpoint found — starting from scratch")
 
     if args.init_weights and start_iteration == 1:
-        weights, info = load_network(args.init_weights, device)
-        if weights.legacy_action_encoding:
-            sys.exit('--init-weights needs action encoding 2; '
-                     'pre-v2 policy channels are offset and would train wrongly.')
+        weights, info = load_network(args.init_weights, device)  # Rejects old rules
         network.load_state_dict(weights.state_dict())
         print(f"Initialized weights from {args.init_weights}")
 
@@ -1198,7 +1194,6 @@ def main():
         'channels': cfg['network']['channels'],
         'top_k_actions': cfg['mcts'].get('top_k_actions', 0),
         'value_dropout': value_dropout,
-        'score_diff_targets': score_diff_targets,
         'score_input': score_input,
         'margin_scale': cfg['training'].get('margin_scale', 0.0),
         'root_top_k': cfg['mcts'].get('root_top_k'),
@@ -1336,7 +1331,7 @@ def main():
             epochs=cfg['training']['epochs_per_iter'],
             value_loss_weight=cfg['training'].get('value_loss_weight', 1.0),
             device=device,
-            mirror_augment=cfg['training'].get('mirror_augment', False),
+            rotation_augment=cfg['training'].get('rotation_augment', False),
         )
         train_time = time.time() - t_tr
 
@@ -1407,7 +1402,7 @@ def main():
                     _atomic_torch_save(
                         {'iteration': iteration, 'config': cfg,
                          'model_state_dict': network.state_dict(),
-                         'action_encoding': ACTION_ENCODING_VERSION,
+                         'rules_version': RULES_VERSION,
                          'eval': mobility},
                         best_eval_path)
             # Free GPU cache after eval games

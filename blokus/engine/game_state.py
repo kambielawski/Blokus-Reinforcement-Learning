@@ -5,8 +5,18 @@ Supports two game modes:
 - 'standard': 4 agents, each controlling one color (1v1v1v1)
 - 'dual': 2 agents, each controlling two colors (1v1 dual-color)
 
-Both modes use a 20x20 board with 4 colors and 21 pieces per color.
-Turn order always cycles: color 0 -> 1 -> 2 -> 3 -> 0 -> ...
+Both modes use a 20x20 board with 4 colors and 21 pieces per color, and follow the
+Mattel rule sheets R1983-0920 and BJV44-0920 (service.mattel.com/instruction_sheets):
+- Order of play is blue, yellow, red, green, proceeding clockwise around the board.
+- In the two-player game one player controls blue and red, the other yellow and
+  green, which puts each player in two opposite corners.
+- A color that cannot place a piece passes. The game ends when no color can place.
+- Scoring (the sheets' advanced scoring): -1 per square in remaining pieces, +15 for
+  placing all 21 pieces, and +5 more if the last piece placed was the single square.
+  A two-player score is the sum of the player's two colors.
+
+The sheets say a first piece must cover "a corner square" without tying colors to
+corners. Here each color has a fixed corner, in clockwise order, as seating would give.
 """
 
 import numpy as np
@@ -46,9 +56,11 @@ NUM_PIECES = 21
 MAX_ORIENTATIONS = 8
 NUM_COLORS = 4
 
-# Bumped when the meaning of an action index changes. Version 2 normalized four
-# orientations of pieces 18-20 to (0, 0); see BlokusNetwork.legacy_action_encoding.
-ACTION_ENCODING_VERSION = 2
+# Bumped when a checkpoint trained under the old value stops being meaningful.
+# 1: same-side corners, game ended at 21 pieces, score was squares placed, and 91
+#    placements were unreachable (last run at git tag old-rules-final).
+# 2: table rules as described at the top of this file.
+RULES_VERSION = 2
 
 # Total action space: piece_id * (8 * 20 * 20) + ori_id * (20 * 20) + row * 20 + col
 ACTION_SPACE_SIZE = NUM_PIECES * MAX_ORIENTATIONS * BOARD_SIZE * BOARD_SIZE  # 67,200
@@ -56,19 +68,24 @@ ACTION_SPACE_SIZE = NUM_PIECES * MAX_ORIENTATIONS * BOARD_SIZE * BOARD_SIZE  # 6
 # Board corner assignments for each color index (0-3) -> (row, col)
 COLOR_CORNERS = {
     0: (0, 0),
-    1: (BOARD_SIZE - 1, BOARD_SIZE - 1),
-    2: (0, BOARD_SIZE - 1),
+    1: (0, BOARD_SIZE - 1),
+    2: (BOARD_SIZE - 1, BOARD_SIZE - 1),
     3: (BOARD_SIZE - 1, 0),
 }
 
 # Color names for display
-COLOR_NAMES = {0: 'Yellow', 1: 'Blue', 2: 'Red', 3: 'Green'}
+COLOR_NAMES = {0: 'Blue', 1: 'Yellow', 2: 'Red', 3: 'Green'}
+
+# Scoring bonuses (see the top of this file)
+ALL_PIECES_BONUS = 15
+LAST_PIECE_MONOMINO_BONUS = 5
+MONOMINO_ID = 0
 
 # RGB colors for rendering
 COLOR_RGB = {
     0: (240, 240, 240),  # empty: light gray
-    1: (255, 220, 0),    # yellow
-    2: (0, 100, 255),    # blue
+    1: (0, 100, 255),    # blue
+    2: (255, 220, 0),    # yellow
     3: (255, 50, 50),    # red
     4: (50, 200, 50),    # green
 }
@@ -357,11 +374,13 @@ class GameState:
     """
 
     __slots__ = ['board', 'pieces_remaining', 'current_color',
-                 'consecutive_passes', 'game_mode', 'pieces', '_has_played']
+                 'consecutive_passes', 'game_mode', 'pieces', '_has_played',
+                 '_last_piece']
 
     def __init__(self, board: np.ndarray, pieces_remaining: tuple,
                  current_color: int, consecutive_passes: int,
-                 game_mode: str, pieces: List[PieceInfo], has_played: tuple):
+                 game_mode: str, pieces: List[PieceInfo], has_played: tuple,
+                 last_piece: tuple = (None, None, None, None)):
         self.board = board
         self.pieces_remaining = pieces_remaining  # tuple of 4 frozensets
         self.current_color = current_color        # 0-3
@@ -369,6 +388,7 @@ class GameState:
         self.game_mode = game_mode                # 'standard' or 'dual'
         self.pieces = pieces                      # shared reference
         self._has_played = has_played             # tuple of 4 bools
+        self._last_piece = last_piece             # last piece id per color, for scoring
 
     # ---- Factory ----
 
@@ -393,7 +413,8 @@ class GameState:
         """Shallow copy with new board array."""
         return GameState(
             self.board.copy(), self.pieces_remaining, self.current_color,
-            self.consecutive_passes, self.game_mode, self.pieces, self._has_played)
+            self.consecutive_passes, self.game_mode, self.pieces, self._has_played,
+            self._last_piece)
 
     # ---- Query methods ----
 
@@ -417,24 +438,29 @@ class GameState:
         return 4 if self.game_mode == 'standard' else 2
 
     def is_terminal(self) -> bool:
-        """True if the game is over.
+        """True once no color can place a piece: all 4 passed in a row.
 
-        Terminal conditions:
-        1. All 4 colors passed consecutively (no one can move).
-        2. Any color has placed all 21 pieces.
+        A color with no move can never get one back, since only its own new pieces
+        create places to play. Placing all 21 pieces does not end the game; that
+        color simply passes from then on.
         """
-        if self.consecutive_passes >= NUM_COLORS:
-            return True
-        for remaining in self.pieces_remaining:
-            if len(remaining) == 0:
-                return True
-        return False
+        return self.consecutive_passes >= NUM_COLORS
+
+    def get_squares_placed(self) -> Dict[int, int]:
+        """Number of squares on the board per color index."""
+        return {ci: int(np.sum(self.board == (ci + 1))) for ci in range(NUM_COLORS)}
 
     def get_scores(self) -> Dict[int, int]:
-        """Score per color index: number of squares occupied on the board."""
+        """Rule-book score per color index (see the top of this file)."""
         scores = {}
         for ci in range(NUM_COLORS):
-            scores[ci] = int(np.sum(self.board == (ci + 1)))
+            remaining = self.pieces_remaining[ci]
+            if remaining:
+                scores[ci] = -sum(self.pieces[pid].num_cells for pid in remaining)
+            elif self._last_piece[ci] == MONOMINO_ID:
+                scores[ci] = ALL_PIECES_BONUS + LAST_PIECE_MONOMINO_BONUS
+            else:
+                scores[ci] = ALL_PIECES_BONUS
         return scores
 
     def get_rewards(self) -> Dict[int, float]:
@@ -530,16 +556,20 @@ class GameState:
         hp[ci] = True
         new_hp = tuple(hp)
 
+        lp = list(self._last_piece)
+        lp[ci] = pid
+        new_lp = tuple(lp)
+
         next_color = (ci + 1) % NUM_COLORS
         return GameState(new_board, new_pr, next_color, 0,
-                         self.game_mode, self.pieces, new_hp)
+                         self.game_mode, self.pieces, new_hp, new_lp)
 
     def pass_turn(self) -> 'GameState':
         """Current color passes (no legal moves). Advances turn."""
         next_color = (self.current_color + 1) % NUM_COLORS
         return GameState(self.board, self.pieces_remaining, next_color,
                          self.consecutive_passes + 1, self.game_mode,
-                         self.pieces, self._has_played)
+                         self.pieces, self._has_played, self._last_piece)
 
     # ---- Neural network state ----
 
@@ -563,7 +593,7 @@ class GameState:
 
     def render_text(self) -> str:
         """ASCII board representation."""
-        syms = {0: '.', 1: 'Y', 2: 'B', 3: 'R', 4: 'G'}
+        syms = {0: '.', 1: 'B', 2: 'Y', 3: 'R', 4: 'G'}
         lines = []
         for r in range(BOARD_SIZE):
             lines.append(' '.join(syms[int(self.board[r, c])]

@@ -4,6 +4,7 @@ from typing import Any, Dict, Tuple
 
 import torch
 
+from blokus.engine.game_state import RULES_VERSION
 from blokus.nn.network import (
     BlokusNetwork, BOARD_SIZE, PIECE_REMAINING_SIZE, SCORE_VECTOR_SIZE,
 )
@@ -18,6 +19,11 @@ def load_network(path: str, device: torch.device) -> Tuple[BlokusNetwork, Dict[s
     Returns (network in eval mode, info dict with iteration and config).
     """
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    rules = ckpt.get('rules_version', 1)
+    if rules != RULES_VERSION:
+        raise ValueError(
+            f'{path} was trained under rules version {rules}, this engine plays version '
+            f'{RULES_VERSION}. To run old-rules checkpoints, use git tag old-rules-final.')
     cfg = ckpt.get('config', {})
     net_cfg = cfg.get('network', {})
     state_dict = ckpt['model_state_dict']
@@ -32,14 +38,12 @@ def load_network(path: str, device: torch.device) -> Tuple[BlokusNetwork, Dict[s
         score_input=score_input,
     )
     network.load_state_dict(state_dict)
-    network.legacy_action_encoding = ckpt.get('action_encoding', 1) < 2
     network.to(device).eval()
 
     info = {
         'iteration': ckpt.get('iteration'),
         'cumulative_games': ckpt.get('cumulative_games'),
         'game_mode': cfg.get('self_play', {}).get('game_mode'),
-        'score_diff_targets': cfg.get('training', {}).get('score_diff_targets', False),
         'config': cfg,
     }
     return network, info

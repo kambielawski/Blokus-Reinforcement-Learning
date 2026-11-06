@@ -26,9 +26,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from blokus.agents.bots import MobilityBot
 from blokus.engine.game_state import (
-    ACTION_ENCODING_VERSION, ACTION_SPACE_SIZE, GameState, decode_action, load_pieces,
+    ACTION_SPACE_SIZE, GameState, RULES_VERSION, decode_action, load_pieces,
 )
-from blokus.engine.symmetry import mirror_action_table
+from blokus.engine.symmetry import rotation_action_tables
 from blokus.nn.network import BlokusNetwork, make_pieces_remaining_vector
 
 
@@ -93,14 +93,14 @@ def main() -> None:
     train = [e for game in games[holdout:] for e in game]
     del games, examples
 
-    mirror = mirror_action_table()
+    tables = rotation_action_tables()
     device = torch.device(args.device)
     network = BlokusNetwork(num_blocks=args.num_blocks, channels=args.channels).to(device)
     optimizer = torch.optim.AdamW(network.parameters(), lr=args.lr, weight_decay=1e-4)
     total_steps = args.epochs * math.ceil(len(train) / args.batch_size)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, total_steps=total_steps)
 
-    def batch_tensors(batch: List[Any], flip: np.ndarray) -> Tuple[torch.Tensor, ...]:
+    def batch_tensors(batch: List[Any], turns: np.ndarray) -> Tuple[torch.Tensor, ...]:
         n = len(batch)
         boards = np.empty((n, 5, 20, 20), dtype=np.float32)
         pieces = np.empty((n, 84), dtype=np.float32)
@@ -108,14 +108,10 @@ def main() -> None:
         targets = np.empty(n, dtype=np.int64)
         values = np.empty(n, dtype=np.float32)
         for i, (b, p, legal, action, value) in enumerate(batch):
-            if flip[i]:
-                boards[i] = b[:, :, ::-1]
-                masks[i, mirror[legal]] = 1.0
-                targets[i] = mirror[action]
-            else:
-                boards[i] = b
-                masks[i, legal] = 1.0
-                targets[i] = action
+            table = tables[turns[i]]
+            boards[i] = np.rot90(b, k=-int(turns[i]), axes=(1, 2))
+            masks[i, table[legal]] = 1.0
+            targets[i] = table[action]
             pieces[i] = p
             values[i] = value
         return tuple(torch.from_numpy(x).to(device)
@@ -128,7 +124,7 @@ def main() -> None:
         with torch.no_grad():
             for i in range(0, len(val), args.batch_size):
                 chunk = val[i:i + args.batch_size]
-                boards, pieces, masks, targets, values = batch_tensors(chunk, np.zeros(len(chunk), bool))
+                boards, pieces, masks, targets, values = batch_tensors(chunk, np.zeros(len(chunk), int))
                 log_policy, value = network(boards, pieces, masks)
                 policy_loss += F.nll_loss(log_policy, targets, reduction='sum').item()
                 value_loss += F.mse_loss(value, values, reduction='sum').item()
@@ -148,7 +144,7 @@ def main() -> None:
         order = rng.permutation(len(train))
         for start in range(0, len(train), args.batch_size):
             chunk = [train[i] for i in order[start:start + args.batch_size]]
-            boards, pieces, masks, targets, values = batch_tensors(chunk, rng.random(len(chunk)) < 0.5)
+            boards, pieces, masks, targets, values = batch_tensors(chunk, rng.integers(0, 4, size=len(chunk)))
             log_policy, value = network(boards, pieces, masks)
             loss = F.nll_loss(log_policy, targets) + F.mse_loss(value, values)
             optimizer.zero_grad(set_to_none=True)
@@ -164,7 +160,7 @@ def main() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     torch.save({
         'iteration': 0,
-        'action_encoding': ACTION_ENCODING_VERSION,
+        'rules_version': RULES_VERSION,
         'model_state_dict': {k: v.cpu() for k, v in network.state_dict().items()},
         'config': {
             'network': {'num_blocks': args.num_blocks, 'channels': args.channels},

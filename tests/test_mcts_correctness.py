@@ -12,6 +12,7 @@ import torch
 
 from blokus.engine.game_state import GameState, ACTION_SPACE_SIZE
 from blokus.nn.network import BlokusNetwork, make_pieces_remaining_vector
+from blokus.engine.game_state import decode_action
 from blokus.mcts.mcts import MCTS, MCTSNode
 
 
@@ -196,31 +197,35 @@ def _play_eval_game(network, device, use_mcts, game_mode='dual'):
     return 0.5
 
 
-class TestMCTSImproves:
-    """MCTS should perform at least as well as raw policy against random."""
+class _UninformedNetwork(BlokusNetwork):
+    """Uniform prior and zero value, so only tie-breaking separates moves."""
 
-    @pytest.mark.slow
-    def test_mcts_at_least_as_good_as_raw(self, network, device):
-        """Run 20 games each (raw vs random, MCTS vs random).
-        MCTS win rate should be >= raw policy win rate.
-        With a random untrained network, MCTS search should still help
-        by exploring more of the game tree."""
-        num_games = 20
+    def forward(self, board, pieces, mask, score_vector=None):
+        logits = torch.where(mask > 0, torch.zeros_like(mask), torch.full_like(mask, -1e8))
+        return torch.log_softmax(logits, dim=1), torch.zeros(board.shape[0])
 
-        raw_score = sum(_play_eval_game(network, device, use_mcts=False)
-                        for _ in range(num_games))
-        mcts_score = sum(_play_eval_game(network, device, use_mcts=True)
-                         for _ in range(num_games))
 
-        raw_rate = raw_score / num_games
-        mcts_rate = mcts_score / num_games
+class TestNoTieBreakBias:
+    """Legal moves are sorted by piece id. Ties must not pick small pieces first."""
 
-        # MCTS should not be significantly worse than raw policy.
-        # Allow small margin for randomness.
-        assert mcts_rate >= raw_rate - 0.15, (
-            f"MCTS win rate ({mcts_rate:.1%}) should not be much worse than "
-            f"raw policy ({raw_rate:.1%}). Sign bug may be present."
-        )
+    def test_uninformed_search_is_not_biased_to_small_pieces(self):
+        network = _UninformedNetwork(num_blocks=1, channels=8)
+        state = GameState.new_game('dual')
+        for action in [decode_action_first_big(state)]:
+            state = state.apply_action(action)
+        # Far fewer sims than legal moves, so most of the choice is tie-breaking
+        mcts = MCTS(network, num_simulations=8, dirichlet_alpha=0.0, temperature=0.0,
+                    batch_size=1)
+        pieces = [decode_action(mcts.select_action(state)[0])[0] for _ in range(40)]
+        # The old bias always picked one of the first few pieces, which are the smallest
+        assert np.mean(pieces) > 5, pieces
+        assert len(set(pieces)) > 5, pieces
+
+
+def decode_action_first_big(state: GameState) -> int:
+    """Any legal pentomino."""
+    return next(a for a in state.get_legal_actions()
+                if state.pieces[decode_action(a)[0]].num_cells == 5)
 
 
 # ---------------------------------------------------------------------------

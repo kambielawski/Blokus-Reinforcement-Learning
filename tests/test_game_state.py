@@ -155,9 +155,10 @@ class TestNewGame:
         legal = new_standard_game.get_legal_actions()
         assert len(legal) > 0
 
-    def test_scores_all_zero(self, new_standard_game):
+    def test_scores_start_at_minus_all_squares(self, new_standard_game):
         scores = new_standard_game.get_scores()
-        assert all(s == 0 for s in scores.values())
+        assert all(s == -89 for s in scores.values())
+        assert all(s == 0 for s in new_standard_game.get_squares_placed().values())
 
     def test_game_mode_standard(self, new_standard_game):
         assert new_standard_game.game_mode == 'standard'
@@ -348,7 +349,8 @@ class TestStateTransitions:
         piece_size = state.pieces[pid].num_cells
 
         new_state = state.apply_action(action)
-        assert new_state.get_scores()[0] == piece_size
+        assert new_state.get_scores()[0] == -89 + piece_size
+        assert new_state.get_squares_placed()[0] == piece_size
 
     def test_copy_is_independent(self, new_standard_game):
         state = new_standard_game
@@ -378,16 +380,16 @@ class TestTerminal:
             state = state.pass_turn()
         assert not state.is_terminal()
 
-    def test_terminal_when_all_pieces_played(self, new_standard_game):
-        """Simulate all pieces played by one color."""
+    def test_not_terminal_when_one_color_played_all_pieces(self, new_standard_game):
+        """Table rules: the others keep playing; the finished color just passes."""
         state = new_standard_game
         # Manually create a state where color 0 has no pieces left
         pr = list(state.pieces_remaining)
         pr[0] = frozenset()
-        terminal_state = GameState(
+        finished = GameState(
             state.board, tuple(pr), state.current_color, 0,
             state.game_mode, state.pieces, state._has_played)
-        assert terminal_state.is_terminal()
+        assert not finished.is_terminal()
 
     def test_full_game_terminates(self):
         """A random game should always terminate."""
@@ -550,8 +552,8 @@ class TestEdgeCases:
         for seed in [1, 42, 100, 999]:
             final, hist = play_random_game('standard', seed=seed)
             assert final.is_terminal()
-            scores = final.get_scores()
-            assert all(s >= 0 for s in scores.values())
+            # -89 with nothing placed, +20 is the most a color can score
+            assert all(-89 <= s <= 20 for s in final.get_scores().values())
 
     def test_dual_game_ends_no_crash(self):
         from blokus.engine.game_state import play_random_game
