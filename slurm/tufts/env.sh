@@ -1,11 +1,15 @@
 # Settings shared by the Tufts scripts. Source this; do not run it.
 
-# >>> CONFIRM BEFORE FIRST USE <<<
-# Partition. "gpu" comes from notes, not from a check of this account. Use "preempt"
-# only with a run you are happy to have killed; the job script resumes either way.
+# Checked with sinfo on 2026-11-05. Use "preempt" only for work that may be killed
+# at any time; the job script resumes either way.
 export BLOKUS_PARTITION="gpu"
 
 export BLOKUS_REPO="$HOME/dev/Blokus-Reinforcement-Learning"
-export BLOKUS_VENV="$HOME/venvs/blokus"              # Home: scratch purges unaccessed files
 export BLOKUS_SCRATCH="/cluster/scratch/$USER/blokus"
-export BLOKUS_PYTHON_MODULE="anaconda/2024.06"       # Only used to create the venv
+export BLOKUS_VENV="$BLOKUS_SCRATCH/venv"      # Home is nearly full; setup_env.sh rebuilds it
+export UV_CACHE_DIR="/cluster/scratch/$USER/uv-cache"
+export WANDB_DIR="$BLOKUS_SCRATCH/wandb"
+
+blokus_modules() {
+    module load uv/0.9.18 python/3.13.2
+}
