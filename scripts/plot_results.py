@@ -2,8 +2,8 @@
 """Charts for strength ladders and search diagnostics.
 
 Usage:
-    python scripts/plot_results.py ladder data/ladder/search-test --opponent mobility \\
-        --title "..." --out output/ladder.png
+    python scripts/plot_results.py ladder data/ladder/search-test \\
+        --label "a,mobility=A vs mobility" --title "..." --out output/ladder.png
     python scripts/plot_results.py search data/diagnostics/*.json --title "..." --out output/search.png
     python scripts/plot_results.py training a.out b.out --names 5b 10b --title "..." --out output/train.png
 """
@@ -36,45 +36,46 @@ def _style(ax: plt.Axes) -> None:
     ax.tick_params(colors=MUTED, length=0)
 
 
-def plot_ladder(directory: str, opponent: str, labels: Dict[str, str], title: str, out: str) -> None:
-    """Score against one opponent, with a 95% interval, one row per player."""
-    results: Dict[str, List[float]] = defaultdict(list)
+def plot_ladder(directory: str, labels: Dict[str, str], title: str, out: str) -> None:
+    """One row per matchup "A,B": A's score against B, with a 95% interval."""
+    games: Dict[Tuple[str, str], List[float]] = defaultdict(list)
     with open(os.path.join(directory, 'games.jsonl')) as f:
         for line in f:
             game = json.loads(line)
-            if opponent not in (game['seat0'], game['seat1']):
-                continue
-            player = game['seat1'] if game['seat0'] == opponent else game['seat0']
             diff = game['score0'] - game['score1']
-            diff = -diff if game['seat0'] == opponent else diff
-            results[player].append(1.0 if diff > 0 else (0.5 if diff == 0 else 0.0))
+            result = 1.0 if diff > 0 else (0.5 if diff == 0 else 0.0)
+            games[(game['seat0'], game['seat1'])].append(result)
+            games[(game['seat1'], game['seat0'])].append(1.0 - result)
 
-    players = [p for p in labels if p in results]
-    fig, ax = plt.subplots(figsize=(9, 0.5 * len(players) + 1.9), facecolor=SURFACE)
+    rows = [tuple(key.split(',')) for key in labels if tuple(key.split(',')) in games]
+    height = 0.5 * len(rows) + 1.9
+    fig, ax = plt.subplots(figsize=(9.5, height), facecolor=SURFACE)
     _style(ax)
     ax.axvline(50, color=MUTED, lw=1, ls=(0, (3, 3)), zorder=1)
-    for y, player in enumerate(reversed(players)):
-        n = len(results[player])
-        points = sum(results[player])
+    names = [labels[','.join(row)] for row in rows]
+    for y, row in enumerate(reversed(rows)):
+        results = games[row]
+        n, points = len(results), sum(results)
         lo, hi = wilson(points, n)
-        small_q = 'x0.1' in labels[player]
+        small_q = 'x0.1' in labels[','.join(row)]
         color = SERIES[1] if small_q else SERIES[0]
         ax.plot([100 * lo, 100 * hi], [y, y], color=color, lw=2, solid_capstyle='round', zorder=2)
         ax.scatter(100 * points / n, y, s=64, color=color, marker='s' if small_q else 'o',
                    edgecolor=SURFACE, linewidth=1.5, zorder=3)
         ax.text(101.5, y, f'{100 * points / n:.1f}%  (n={n})', va='center', color=INK, fontsize=9)
-    ax.set_yticks(range(len(players)))
-    ax.set_yticklabels([labels[p] for p in reversed(players)], color=INK, fontsize=10)
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels(list(reversed(names)), color=INK, fontsize=10)
     ax.set_xlim(0, 100)
-    ax.set_xlabel(f'Score against {opponent} (win = 1, draw = ½), with 95% Wilson interval', color=MUTED)
+    ax.set_xlabel('Score (win = 1, draw = ½), with 95% Wilson interval', color=MUTED)
     ax.grid(axis='x', color=GRID, lw=0.8)
     ax.set_axisbelow(True)
-    handles = [plt.Line2D([], [], marker='o', color=SERIES[0], lw=2, label='Normal value scale'),
-               plt.Line2D([], [], marker='s', color=SERIES[1], lw=2, label='Values shrunk x0.1')]
-    ax.legend(handles=handles, loc='lower center', bbox_to_anchor=(0.5, 1.0), ncol=2, frameon=False,
-              labelcolor=MUTED, fontsize=9)
+    if any('x0.1' in name for name in names):
+        handles = [plt.Line2D([], [], marker='o', color=SERIES[0], lw=2, label='Normal value scale'),
+                   plt.Line2D([], [], marker='s', color=SERIES[1], lw=2, label='Values shrunk x0.1')]
+        ax.legend(handles=handles, loc='lower center', bbox_to_anchor=(0.5, 1.0), ncol=2,
+                  frameon=False, labelcolor=MUTED, fontsize=9)
     fig.tight_layout()
-    fig.subplots_adjust(right=0.86, top=1 - 1.0 / (0.5 * len(players) + 1.9))
+    fig.subplots_adjust(right=0.86, top=1 - 1.0 / height)
     fig.suptitle(title, x=0.01, ha='left', color=INK, fontsize=12, fontweight='bold')
     fig.savefig(out, dpi=170, facecolor=SURFACE)
 
@@ -153,16 +154,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('kind', choices=['ladder', 'search', 'training'])
     parser.add_argument('inputs', nargs='+')
-    parser.add_argument('--opponent', default='mobility')
     parser.add_argument('--names', nargs='*', default=[], help='Run names, for training charts')
-    parser.add_argument('--label', action='append', default=[], help='player=Display name, in row order')
+    parser.add_argument('--label', action='append', default=[], help='A,B=Display name, in row order')
     parser.add_argument('--title', required=True)
     parser.add_argument('--out', required=True)
     args = parser.parse_args()
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     if args.kind == 'ladder':
         labels = dict(item.split('=', 1) for item in args.label)
-        plot_ladder(args.inputs[0], args.opponent, labels, args.title, args.out)
+        plot_ladder(args.inputs[0], labels, args.title, args.out)
     elif args.kind == 'training':
         plot_training(args.inputs, args.names, args.title, args.out)
     else:
