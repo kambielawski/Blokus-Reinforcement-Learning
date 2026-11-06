@@ -5,12 +5,14 @@ Usage:
     python scripts/plot_results.py ladder data/ladder/search-test --opponent mobility \\
         --title "..." --out output/ladder.png
     python scripts/plot_results.py search data/diagnostics/*.json --title "..." --out output/search.png
+    python scripts/plot_results.py training a.out b.out --names 5b 10b --title "..." --out output/train.png
 """
 
 import argparse
 import json
 import math
 import os
+import re
 import sys
 from collections import defaultdict
 from typing import Dict, List, Tuple
@@ -108,11 +110,51 @@ def plot_search(paths: List[str], title: str, out: str) -> None:
     fig.savefig(out, dpi=170, facecolor=SURFACE)
 
 
+def plot_training(logs: List[str], names: List[str], title: str, out: str) -> None:
+    """Training curves from Slurm logs: losses and in-training score against the heuristic."""
+    panels = (('policy', 'Policy loss'), ('value', 'Value loss'),
+              ('eval', 'Score vs mobility at 50 sims (%)'))
+    fig, axes = plt.subplots(1, 3, figsize=(13, 3.8), facecolor=SURFACE)
+    for index, (path, name) in enumerate(zip(logs, names)):
+        series: Dict[str, Tuple[List[int], List[float]]] = {p[0]: ([], []) for p in panels}
+        iteration = 0
+        with open(path) as f:
+            for line in f:
+                found = re.match(r'Iteration (\d+)/', line)
+                if found:
+                    iteration = int(found.group(1))
+                found = re.search(r'policy_loss=([\d.]+), value_loss=([\d.]+)', line)
+                if found:
+                    series['policy'][0].append(iteration)
+                    series['policy'][1].append(float(found.group(1)))
+                    series['value'][0].append(iteration)
+                    series['value'][1].append(float(found.group(2)))
+                found = re.search(r'Eval vs mobility: score=([\d.]+)%', line)
+                if found:
+                    series['eval'][0].append(iteration)
+                    series['eval'][1].append(float(found.group(1)))
+        for ax, (key, _) in zip(axes, panels):
+            marker = 'o' if index == 0 else 's'
+            ax.plot(*series[key], color=SERIES[index], lw=2, marker=marker if key == 'eval' else None,
+                    markersize=6, label=name)
+    for ax, (_, label) in zip(axes, panels):
+        _style(ax)
+        ax.set_title(label, loc='left', color=INK, fontsize=10.5, fontweight='bold')
+        ax.set_xlabel('Iteration', color=MUTED, fontsize=9)
+        ax.grid(axis='y', color=GRID, lw=0.8)
+    axes[2].set_ylim(0, 100)
+    axes[0].legend(frameon=False, labelcolor=MUTED, fontsize=9)
+    fig.suptitle(title, x=0.01, ha='left', color=INK, fontsize=12, fontweight='bold')
+    fig.tight_layout()
+    fig.savefig(out, dpi=170, facecolor=SURFACE)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('kind', choices=['ladder', 'search'])
+    parser.add_argument('kind', choices=['ladder', 'search', 'training'])
     parser.add_argument('inputs', nargs='+')
     parser.add_argument('--opponent', default='mobility')
+    parser.add_argument('--names', nargs='*', default=[], help='Run names, for training charts')
     parser.add_argument('--label', action='append', default=[], help='player=Display name, in row order')
     parser.add_argument('--title', required=True)
     parser.add_argument('--out', required=True)
@@ -121,6 +163,8 @@ def main() -> None:
     if args.kind == 'ladder':
         labels = dict(item.split('=', 1) for item in args.label)
         plot_ladder(args.inputs[0], args.opponent, labels, args.title, args.out)
+    elif args.kind == 'training':
+        plot_training(args.inputs, args.names, args.title, args.out)
     else:
         plot_search(args.inputs, args.title, args.out)
 
