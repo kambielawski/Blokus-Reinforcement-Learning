@@ -1,0 +1,50 @@
+# First long table-rules run. Evidence and reasoning: project note training-plan.
+# Start from imitation weights with --init-weights. Network size is set per run.
+
+network:
+  num_blocks: 10
+  channels: 128
+
+mcts:
+  num_simulations: 400
+  c_puct: 1.5
+  top_k_actions: 50         # Interior nodes, for speed
+  root_top_k: 0             # Every legal move stays reachable at the root in self-play
+  dirichlet_alpha: 0.1      # Lower than chess: about 300 legal moves
+
+training:
+  learning_rate: 0.0005
+  batch_size: 256
+  epochs_per_iter: 0.25     # With this buffer, each example is reused about 8 times
+  iterations: 600
+  replay_buffer_size: 300000
+  value_loss_weight: 1.0    # Targets have variance near 0.25
+  margin_scale: 20.0        # Value target and terminal value: tanh(margin / 20)
+  rotation_augment: true
+  lr_schedule:
+    enabled: true
+    warmup_iters: 5
+    min_lr: 0.00005
+
+self_play:
+  games_per_iteration: 150
+  num_workers: 24
+  game_mode: dual
+
+eval:
+  interval: 5
+  games: 0                  # Skip vs-random: it saturates and costs time
+  mobility_pairs: 50
+  mobility_sims: 50         # Low on purpose: at 800 sims the score is already 99%
+
+checkpoint:
+  dir: data/tufts-v1-10b        # Overridden by the job script with a scratch path
+  save_every_n_iters: 1
+  keep_top_k: 1
+  keep_every: 25            # Permanent history for the ladder
+
+wandb:
+  enabled: true
+  run_name: tufts-v1-10b
+
+device: auto
