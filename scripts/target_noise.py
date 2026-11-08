@@ -10,8 +10,9 @@ Searches leave most moves unvisited, so KL(A||B) is infinite without smoothing;
 B is mixed with SMOOTH of the prior for the KL. Total variation and argmax
 agreement need no smoothing.
 
-Positions come from games in ladder JSONL files, sampled evenly per game phase
-(pieces left over all colors).
+Positions come from games in ladder JSONL files, or with --selfplay N from N fresh
+self-play games of the checkpoint itself, sampled evenly per game phase (pieces
+left over all colors).
 
 Usage:
   python scripts/target_noise.py --checkpoint i276.pt --games a.jsonl b.jsonl \
@@ -60,6 +61,32 @@ def sample_positions(paths, per_phase: int, seed: int):
                 state = state.pass_turn() if action == -1 else state.apply_action(action)
     rng = random.Random(seed)
     return {phase: rng.sample(items, min(per_phase, len(items))) for phase, items in found.items()}
+
+
+def selfplay_game(task):
+    """Move list of one self-play game with the training settings and temperature schedule."""
+    checkpoint, sims, seed, cfg, temp_moves = task
+    torch.set_num_threads(1)
+    net = load_network(checkpoint, torch.device('cpu'))[0]
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    mcts = MCTS(net, c_puct=cfg['c_puct'], num_simulations=sims,
+                dirichlet_alpha=cfg['dirichlet_alpha'], dirichlet_epsilon=cfg['dirichlet_epsilon'],
+                temperature=1.0, device=torch.device('cpu'), batch_size=cfg['batch_size'],
+                top_k_actions=cfg['top_k_actions'], terminal_margin_scale=cfg['margin_scale'],
+                root_top_k=cfg['root_top_k'])
+    state, moves, played = GameState.new_game('dual'), [], 0
+    while not state.is_terminal():
+        if not state.get_legal_actions():
+            state = state.pass_turn()
+            moves.append(-1)
+            continue
+        mcts.temperature = 1.0 if played < temp_moves else 0.01   # As self_play_game
+        action, _, _ = mcts.select_action(state)
+        state = state.apply_action(action)
+        moves.append(action)
+        played += 1
+    return {'moves': moves}
 
 
 def search_policy(net, state, sims, seed, cfg):
@@ -114,7 +141,9 @@ def measure(task):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('--checkpoint', required=True)
-    parser.add_argument('--games', nargs='+', required=True)
+    parser.add_argument('--games', nargs='+', default=[])
+    parser.add_argument('--selfplay', type=int, default=0,
+                        help='Also play this many self-play games and sample from them')
     parser.add_argument('--per-phase', type=int, default=300)
     parser.add_argument('--sims', type=int, default=None, help='Default: the checkpoint config')
     parser.add_argument('--workers', type=int, default=8)
@@ -131,7 +160,18 @@ def main():
     sims = args.sims or m['num_simulations']
     print(f'sims {sims}, settings {cfg}', flush=True)
 
-    positions = sample_positions(args.games, args.per_phase, args.seed)
+    games = list(args.games)
+    if args.selfplay:
+        temp_moves = info['mcts'].get('temp_threshold_move', 15)
+        path = os.path.splitext(args.out)[0] + '-selfplay.jsonl'
+        with mp.get_context('spawn').Pool(args.workers) as pool, open(path, 'w') as f:
+            for k, game in enumerate(pool.imap_unordered(
+                    selfplay_game, [(args.checkpoint, sims, args.seed * 7919 + i, cfg, temp_moves)
+                                    for i in range(args.selfplay)])):
+                f.write(json.dumps(game) + '\n')
+                print(f'self-play game {k + 1}/{args.selfplay}', flush=True)
+        games.append(path)
+    positions = sample_positions(games, args.per_phase, args.seed)
     tasks = []
     for i, (phase, items) in enumerate(positions.items()):
         for j, (moves, left) in enumerate(items):
