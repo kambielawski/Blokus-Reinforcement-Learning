@@ -13,6 +13,8 @@
 #SBATCH --gres=gpu:1
 # RTX PRO 6000 (Blackwell, sm_120) needs a newer torch than our cu126 build
 #SBATCH --exclude=pax[186-187]
+# Self-play is CPU-bound: 10b ran 1207 games/hr on a Sapphire Rapids node, 677 on Ice Lake
+#SBATCH --prefer=sapphirerapids
 #SBATCH --cpus-per-task=28
 #SBATCH --mem=96G
 #SBATCH --time=2-00:00:00
