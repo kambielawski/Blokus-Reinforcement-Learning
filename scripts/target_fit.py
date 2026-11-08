@@ -52,5 +52,5 @@ for lo, hi in [(70, 85), (50, 70), (30, 50), (0, 30)]:
         vpred.extend(np.sign(v) == np.sign(val[ch]))
     print(f'pieces left {lo:2d}-{hi:2d}: prior eff moves {np.exp(np.mean(hp)):5.1f}  target eff moves {np.exp(np.mean(ht)):5.1f}  '
           f'KL(target||prior) {np.mean(kl):.3f}  argmax agree {np.mean(agree):.2f}  value sign acc {np.mean(vpred):.2f}')
-print(f'value targets, newest 30000: |v|>0.9 {np.mean(np.abs(val[newest]) > 0.9):.2f}, '
+print(f'value targets, this slice: |v|>0.9 {np.mean(np.abs(val[newest]) > 0.9):.2f}, '
       f'|v|<0.245 (margin under 5) {np.mean(np.abs(val[newest]) < 0.245):.2f}')
