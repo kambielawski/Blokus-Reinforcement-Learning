@@ -7,6 +7,8 @@
 #
 #SBATCH --job-name=blokus-pretrain
 #SBATCH --gres=gpu:1
+# RTX PRO 6000 (Blackwell, sm_120) needs a newer torch than our cu126 build
+#SBATCH --exclude=pax[186-187]
 #SBATCH --cpus-per-task=28
 #SBATCH --mem=128G
 #SBATCH --time=06:00:00
