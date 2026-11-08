@@ -38,6 +38,15 @@ def load_network(path: str, device: torch.device) -> Tuple[BlokusNetwork, Dict[s
         score_input=score_input,
     )
     network.load_state_dict(state_dict)
+    # Weight decay drives unused weights into subnormal floats (a third of the
+    # 5-block net by iter 100), which made CPU inference ~10x slower. They are
+    # below 1.2e-38, so zeroing them changes nothing else.
+    with torch.no_grad():
+        tiny = torch.finfo(torch.float32).tiny
+        for p in network.state_dict().values():
+            if p.is_floating_point():
+                p[p.abs() < tiny] = 0.0
+    torch.set_flush_denormal(True)
     network.to(device).eval()
 
     info = {
