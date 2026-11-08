@@ -3,7 +3,7 @@
 #
 # Usage, from the repo root on a login node (partition comes from env.sh):
 #   source slurm/tufts/env.sh
-#   RUN=tufts-v1 CONFIG=configs/tufts-v1.yaml TARGET=300 INIT=/path/to/imitation.pt \
+#   RUN=tufts-v1 CONFIG=configs/tufts-v1.yaml TARGET=300 INIT=/path/to/imitation.pt SEED=2 \
 #     sbatch --partition="$BLOKUS_PARTITION" --output="$BLOKUS_SCRATCH/logs/%x-%j.out" \
 #     slurm/tufts/train.sbatch
 #
@@ -38,6 +38,7 @@ if [ -f "$RUN_DIR/checkpoint_latest.pt" ]; then
 elif [ -n "${INIT:-}" ]; then
     ARGS+=(--init-weights "$INIT")
 fi
+[ -n "${SEED:-}" ] && ARGS+=(--seed "$SEED")
 
 # In the background so bash can act on the signal while Python runs.
 python -u scripts/train.py "${ARGS[@]}" &

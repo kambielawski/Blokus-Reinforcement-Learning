@@ -22,6 +22,7 @@ import argparse
 import glob
 import math
 import os
+import random
 import signal
 import sys
 import time
@@ -101,6 +102,7 @@ def apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> None:
         'value_dropout':     ('training', 'value_dropout'),
         'score_input':       ('training', 'score_input'),
         'eval_interval':     ('eval', 'interval'),
+        'seed':              ('seed',),
     }
     for arg_name, path in overrides.items():
         val = getattr(args, arg_name, None)
@@ -559,6 +561,12 @@ class ReplayBuffer:
 # Self-play (parallel)
 # ---------------------------------------------------------------------------
 
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
 def _self_play_worker(rank: int, model_state_dict: dict, config: dict,
                       result_queue: mp.Queue, games: int) -> None:
     """Worker process that plays config['games_per_worker'] self-play games.
@@ -567,6 +575,8 @@ def _self_play_worker(rank: int, model_state_dict: dict, config: dict,
     in train_on_examples (mini-batch GPU loading), so GPU memory is free
     during self-play.
     """
+    if config.get('seed_base') is not None:
+        _seed_everything(config['seed_base'] + rank)
     device = torch.device(config['device'])
     network = BlokusNetwork(
         num_blocks=config['num_blocks'],
@@ -1008,6 +1018,9 @@ def main():
                         help='Stop at this absolute iteration, so restarts keep the same '
                              'goal and learning-rate curve. Without it, --iterations more '
                              'are run from wherever training resumes.')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Seed the trainer and self-play workers. Without it, runs '
+                             'draw from OS entropy.')
     parser.add_argument('--init-weights', type=str, default=None,
                         help='Start from these network weights only (fresh optimizer, '
                              'iteration 0, empty buffer). Ignored if --resume finds a checkpoint.')
@@ -1029,6 +1042,9 @@ def main():
     else:
         device = torch.device(device_str)
     print(f"Using device: {device}")
+    if cfg.get('seed') is not None:
+        _seed_everything(cfg['seed'])
+        print(f"Seed: {cfg['seed']}")
 
     # Read experimental flags
     value_dropout = cfg['training'].get('value_dropout', 0.0) or 0.0
@@ -1272,6 +1288,9 @@ def main():
         t_sp = time.time()
         games_this_iter = cfg['self_play']['games_per_iteration']
 
+        if cfg.get('seed') is not None:
+            # Depends on the iteration, so a resumed run does not replay earlier games
+            worker_config['seed_base'] = (cfg['seed'] * 1_000_003 + iteration * 1009) % 2**31
         if use_parallel:
             all_examples = run_self_play_parallel(
                 network=network,
