@@ -30,6 +30,8 @@ class TrainingExample:
         policy_target: (67200,) float32 MCTS visit count distribution.
         value_target: float in [-1, 1] — game outcome from this player's perspective.
         score_vector: (4,) float32 normalized scores (optional, for score_input).
+        policy_weight: 0 if the move got only a fast search, so its visits
+            should not train the policy (playout-cap randomization).
     """
     board_state: np.ndarray
     pieces_remaining: np.ndarray
@@ -37,6 +39,7 @@ class TrainingExample:
     policy_target: np.ndarray
     value_target: float
     score_vector: Optional[np.ndarray] = None
+    policy_weight: float = 1.0
 
 
 class AlphaZeroAgent:
@@ -112,6 +115,8 @@ def self_play_game(network: BlokusNetwork,
                    dirichlet_alpha: float = 0.3,
                    prune_targets: bool = False,
                    random_opening_fraction: float = 0.0,
+                   full_search_prob: float = 1.0,
+                   fast_simulations: int = 0,
                    ) -> List[TrainingExample]:
     """Play a complete self-play game and collect training examples.
 
@@ -135,6 +140,11 @@ def self_play_game(network: BlokusNetwork,
         random_opening_fraction: Share of games that start from a random
             pentomino in each corner (bots.random_opening), as ladder games do.
             Those plies are not recorded, and temperature counts from after them.
+        full_search_prob: Playout-cap randomization (KataGo). Below 1, each move
+            gets the full search (num_simulations, root noise) with this
+            probability; otherwise a fast search of fast_simulations without
+            root noise, whose visits do not train the policy.
+        fast_simulations: Simulations of a fast search.
 
     Returns:
         List of TrainingExample objects for training.
@@ -158,9 +168,10 @@ def self_play_game(network: BlokusNetwork,
         for action in random_opening(int(np.random.randint(2 ** 31))):
             state = state.apply_action(action)
 
-    # Collect (state_data, policy, agent_idx, score_vec) during play
+    # Collect (state_data, policy, agent_idx, score_vec, policy_weight) during play
     game_history: List[Tuple] = []
     move_count = 0
+    noise_weight = agent.mcts.dirichlet_epsilon
 
     while not state.is_terminal():
         if max_moves > 0 and move_count >= max_moves:
@@ -183,11 +194,17 @@ def self_play_game(network: BlokusNetwork,
         current_agent = state.get_current_agent()
         score_vec = make_score_vector(state) if use_score_input else None
 
+        full = full_search_prob >= 1.0 or np.random.random() < full_search_prob
+        if full_search_prob < 1.0:
+            agent.mcts.num_simulations = num_simulations if full else fast_simulations
+            agent.mcts.dirichlet_epsilon = noise_weight if full else 0.0
+
         # MCTS action selection
         action, policy = agent.select_action(state)
 
         game_history.append((
-            board_state, pieces_vec, legal_mask, policy, current_agent, score_vec
+            board_state, pieces_vec, legal_mask, policy, current_agent, score_vec,
+            1.0 if full else 0.0,
         ))
 
         state = state.apply_action(action)
@@ -204,7 +221,7 @@ def self_play_game(network: BlokusNetwork,
 
     # Build training examples
     examples: List[TrainingExample] = []
-    for board_state, pieces_vec, legal_mask, policy, agent_idx, score_vec in game_history:
+    for board_state, pieces_vec, legal_mask, policy, agent_idx, score_vec, weight in game_history:
         value_target = agent_values.get(agent_idx, 0.0)
         examples.append(TrainingExample(
             board_state=board_state,
@@ -213,6 +230,7 @@ def self_play_game(network: BlokusNetwork,
             policy_target=policy,
             value_target=value_target,
             score_vector=score_vec,
+            policy_weight=weight,
         ))
 
     return examples

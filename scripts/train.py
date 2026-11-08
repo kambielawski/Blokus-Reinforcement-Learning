@@ -185,6 +185,8 @@ class CheckpointManager:
                 'pieces_remaining': replay_state['pieces_remaining'],
                 'value_targets': replay_state['value_targets'],
             }
+            if 'policy_weights' in replay_state:
+                save_kwargs['policy_weights'] = replay_state['policy_weights']
             # Sparse CSR format (new) or legacy dense format
             if 'sparse_offsets' in replay_state:
                 save_kwargs['sparse_offsets'] = replay_state['sparse_offsets']
@@ -293,6 +295,9 @@ class ReplayBuffer:
         self._pieces_remaining: Optional[np.ndarray] = None
         self._value_targets: Optional[np.ndarray] = None
         self._score_vectors: Optional[np.ndarray] = None  # only if store_scores
+        # 0 for positions searched only to keep the game going (playout-cap
+        # randomization): they train the value head, not the policy
+        self._policy_weights: Optional[np.ndarray] = None
         # Sparse storage — lists of small arrays, one per example
         self._legal_indices: List[np.ndarray] = []   # each (nnz,) int32
         self._policy_values: List[np.ndarray] = []   # each (nnz,) float32
@@ -304,8 +309,10 @@ class ReplayBuffer:
         old_pr = self._pieces_remaining
         old_vt = self._value_targets
         old_sv = self._score_vectors
+        old_pw = self._policy_weights
 
         self._board_states = np.empty((new_cap, *self._BOARD_SHAPE), dtype=np.float32)
+        self._policy_weights = np.ones(new_cap, dtype=np.float32)
         self._pieces_remaining = np.empty((new_cap, *self._PIECES_SHAPE), dtype=np.float32)
         self._value_targets = np.empty(new_cap, dtype=np.float32)
         if self.store_scores:
@@ -315,6 +322,8 @@ class ReplayBuffer:
             self._board_states[:n] = old_bs[:n]
             self._pieces_remaining[:n] = old_pr[:n]
             self._value_targets[:n] = old_vt[:n]
+            if old_pw is not None:
+                self._policy_weights[:n] = old_pw[:n]
             if self.store_scores and old_sv is not None:
                 self._score_vectors[:n] = old_sv[:n]
 
@@ -351,6 +360,7 @@ class ReplayBuffer:
             self._board_states[:keep_old] = self._board_states[src_start:old_size]
             self._pieces_remaining[:keep_old] = self._pieces_remaining[src_start:old_size]
             self._value_targets[:keep_old] = self._value_targets[src_start:old_size]
+            self._policy_weights[:keep_old] = self._policy_weights[src_start:old_size]
             if self.store_scores and self._score_vectors is not None:
                 self._score_vectors[:keep_old] = self._score_vectors[src_start:old_size]
 
@@ -361,6 +371,7 @@ class ReplayBuffer:
             self._board_states[dst] = ex.board_state
             self._pieces_remaining[dst] = ex.pieces_remaining
             self._value_targets[dst] = ex.value_target
+            self._policy_weights[dst] = getattr(ex, 'policy_weight', 1.0)
             if self.store_scores and ex.score_vector is not None:
                 self._score_vectors[dst] = ex.score_vector
             # Convert dense → sparse
@@ -374,6 +385,10 @@ class ReplayBuffer:
 
     def __len__(self) -> int:
         return self._size
+
+    def policy_weights_tensor(self) -> torch.Tensor:
+        """Per-example policy-loss weights as a CPU tensor view."""
+        return torch.from_numpy(self._policy_weights[:self._size])
 
     @property
     def value_targets_array(self) -> np.ndarray:
@@ -478,10 +493,12 @@ class ReplayBuffer:
         # Dense columns
         if n == cap:
             bs, pr, vt = self._board_states, self._pieces_remaining, self._value_targets
+            pw = self._policy_weights
         else:
             bs = self._board_states[:n].copy()
             pr = self._pieces_remaining[:n].copy()
             vt = self._value_targets[:n].copy()
+            pw = self._policy_weights[:n].copy()
         # Sparse columns → CSR
         offsets = np.zeros(n + 1, dtype=np.int64)
         for i in range(n):
@@ -499,6 +516,7 @@ class ReplayBuffer:
             'board_states': bs,
             'pieces_remaining': pr,
             'value_targets': vt,
+            'policy_weights': pw,
             'sparse_offsets': offsets,
             'sparse_indices': flat_indices,
             'sparse_policy': flat_policy,
@@ -527,6 +545,8 @@ class ReplayBuffer:
         self._board_states[:n] = state['board_states'][:n]
         self._pieces_remaining[:n] = state['pieces_remaining'][:n]
         self._value_targets[:n] = state['value_targets'][:n]
+        if 'policy_weights' in state:      # Older buffers: every example trains the policy
+            self._policy_weights[:n] = state['policy_weights'][:n]
         if self.store_scores and 'score_vectors' in state:
             if self._score_vectors is None:
                 from blokus.nn.network import SCORE_VECTOR_SIZE
@@ -603,6 +623,8 @@ def _self_play_worker(rank: int, model_state_dict: dict, config: dict,
             dirichlet_alpha=config.get('dirichlet_alpha', 0.3),
             prune_targets=config.get('prune_targets', False),
             random_opening_fraction=config.get('random_opening_fraction', 0.0),
+            full_search_prob=config.get('full_search_prob', 1.0),
+            fast_simulations=config.get('fast_simulations', 0),
         )
         result_queue.put(examples)
 
@@ -667,6 +689,8 @@ def run_self_play_sequential(network: BlokusNetwork, num_games: int,
             dirichlet_alpha=cfg['mcts'].get('dirichlet_alpha', 0.3),
             prune_targets=cfg['mcts'].get('prune_targets', False),
             random_opening_fraction=cfg['self_play'].get('random_opening_fraction', 0.0),
+            full_search_prob=cfg['mcts'].get('playout_cap_full_prob', 1.0),
+            fast_simulations=cfg['mcts'].get('playout_cap_fast_sims', 0),
         )
         dt = time.time() - t0
         print(f" {len(examples)} examples in {dt:.1f}s")
@@ -703,6 +727,7 @@ def train_on_examples(network: BlokusNetwork,
 
     # Zero-copy CPU tensors for dense columns
     board_states, pieces_vecs, value_targets, score_vectors = replay_buffer.get_dense_tensors()
+    policy_weights = replay_buffer.policy_weights_tensor()
 
     n = len(replay_buffer)
     total_policy_loss = 0.0
@@ -732,6 +757,7 @@ def train_on_examples(network: BlokusNetwork,
             bs = bs.to(device, non_blocking=True)
             pv = pieces_vecs[idx].to(device, non_blocking=True)
             vt = value_targets[idx].to(device, non_blocking=True)
+            pw = policy_weights[idx].to(device, non_blocking=True)
             sv = None
             if score_vectors is not None:
                 sv = score_vectors[idx].to(device, non_blocking=True)
@@ -743,7 +769,8 @@ def train_on_examples(network: BlokusNetwork,
 
             optimizer.zero_grad()
             log_policy, value_pred = network(bs, pv, lm, score_vector=sv)
-            policy_loss = -torch.sum(pt * log_policy) / bs.size(0)
+            # Mean over the examples that train the policy (all of them by default)
+            policy_loss = -(pw * (pt * log_policy).sum(1)).sum() / pw.sum().clamp_min(1.0)
             value_loss = nn.functional.mse_loss(value_pred, vt)
             loss = policy_loss + value_loss_weight * value_loss
             loss.backward()
@@ -1220,6 +1247,8 @@ def main():
         'dirichlet_alpha': cfg['mcts'].get('dirichlet_alpha', 0.3),
         'prune_targets': cfg['mcts'].get('prune_targets', False),
         'random_opening_fraction': cfg['self_play'].get('random_opening_fraction', 0.0),
+        'full_search_prob': cfg['mcts'].get('playout_cap_full_prob', 1.0),
+        'fast_simulations': cfg['mcts'].get('playout_cap_fast_sims', 0),
     }
 
     num_workers = cfg['self_play']['num_workers']
@@ -1340,6 +1369,9 @@ def main():
         print(f"  Value targets (buffer): mean={vt_mean:+.4f}, std={vt_std:.4f}, "
               f"range=[{vt_min:+.3f}, {vt_max:+.3f}]")
         print(f"  Value targets (iter):   mean={iter_vt_mean:+.4f}, std={iter_vt_std:.4f}")
+        full_share = np.mean([ex.policy_weight for ex in all_examples]) if all_examples else 1.0
+        if full_share < 1.0:
+            print(f"  Policy targets (iter):  {full_share:.1%} of positions from full searches")
 
         # ------ Adjust learning rate ------
         current_lr = get_lr(iteration)
