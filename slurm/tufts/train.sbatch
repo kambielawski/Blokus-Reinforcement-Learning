@@ -16,8 +16,9 @@
 #SBATCH --time=2-00:00:00
 #SBATCH --open-mode=append
 #SBATCH --requeue
-# USR1 five minutes before the limit: finish the iteration, exit, resubmit.
-#SBATCH --signal=B:USR1@300
+# USR1 40 minutes before the limit: finish the iteration, exit, resubmit. A 10-block
+# iteration takes ~15 min, so 5 min was too short and the job hit the limit instead.
+#SBATCH --signal=B:USR1@2400
 
 set -uo pipefail
 source "${SLURM_SUBMIT_DIR}/slurm/tufts/env.sh"
