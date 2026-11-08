@@ -10,6 +10,10 @@ Player specs are name=kind[:key=value...]. Kinds:
     raw:ckpt=PATH
     mcts:ckpt=PATH,sims=200,vs=1,batch=8,topk=50,cpuct=1.5,rootk=50,margin=auto
 
+Openings: by default a random pentomino in each corner (4 plies). With
+--opening policy:ckpt=PATH,plies=4,temp=1 they are sampled from a network's raw
+policy from the empty board instead.
+
 Usage:
     python scripts/ladder.py --out data/ladder/base --pairs-per-matchup 20 \\
         --player random=random --player mob=mobility \\
@@ -35,7 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from blokus.agents.bots import (
     GreedySizeBot, LookaheadBot, MctsBot, MobilityBot, OPENING_PLIES, RandomBot, RawPolicyBot,
-    SpaceBot, random_opening,
+    SpaceBot, policy_opening, random_opening,
 )
 from blokus.engine.game_state import GameState
 from blokus.nn.checkpoint import load_network
@@ -82,6 +86,20 @@ def build_bot(spec: str, seed: int) -> Any:
 _BOTS: Dict[str, Any] = {}
 
 
+def make_opening(spec: str, seed: int) -> List[int]:
+    """'pentomino', or 'policy:ckpt=PATH,plies=4,temp=1' (see the module docstring)."""
+    if spec == 'pentomino':
+        return random_opening(seed)
+    kind, _, rest = spec.partition(':')
+    assert kind == 'policy', spec
+    opts = dict(kv.split('=', 1) for kv in rest.split(','))
+    key = ('opening', opts['ckpt'])
+    if key not in _BOTS:
+        _BOTS[key] = load_network(opts['ckpt'], torch.device('cpu'))[0]
+    return policy_opening(seed, _BOTS[key], plies=int(opts.get('plies', OPENING_PLIES)),
+                          temperature=float(opts.get('temp', 1.0)))
+
+
 def play_game(task: Dict[str, Any]) -> Dict[str, Any]:
     """Play one game in a worker process. Task seats: index 0 plays agent 0."""
     torch.set_num_threads(1)
@@ -94,10 +112,10 @@ def play_game(task: Dict[str, Any]) -> Dict[str, Any]:
 
     started = time.time()
     state = GameState.new_game('dual')
-    moves = random_opening(task['opening_seed'])
+    moves = make_opening(task.get('opening', 'pentomino'), task['opening_seed'])
     for action in moves:
         state = state.apply_action(action)
-    plies = OPENING_PLIES
+    plies = len(moves)
     while not state.is_terminal():
         if not state.get_legal_actions():
             state = state.pass_turn()
@@ -176,6 +194,8 @@ def main() -> None:
                         help='Explicit A,B pairing (repeatable); overrides --gauntlet')
     parser.add_argument('--workers', type=int, default=8)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--opening', default='pentomino',
+                        help="'pentomino' or 'policy:ckpt=PATH,plies=4,temp=1'")
     args = parser.parse_args()
 
     players = dict(p.split('=', 1) for p in args.player)
@@ -206,7 +226,7 @@ def main() -> None:
                 if key not in done_keys:
                     tasks.append({'key': key, 'names': seats,
                                   'specs': (players[seats[0]], players[seats[1]]),
-                                  'opening_seed': opening_seed})
+                                  'opening_seed': opening_seed, 'opening': args.opening})
     # Spread matchups so partial results are useful and worker load stays mixed
     np.random.default_rng(args.seed).shuffle(tasks)
     print(f'{len(pairs)} matchups, {len(tasks)} games to play, {len(done)} already done',

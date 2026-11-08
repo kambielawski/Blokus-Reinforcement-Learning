@@ -97,6 +97,27 @@ def random_opening(seed: int) -> List[int]:
     return actions
 
 
+@torch.no_grad()
+def policy_opening(seed: int, network: torch.nn.Module, plies: int = 4,
+                   temperature: float = 1.0) -> List[int]:
+    """Opening actions from the empty board, each sampled from a network's raw
+    policy: openings a trained player might reach, varied by the seed."""
+    rng = np.random.default_rng(seed)
+    state = GameState.new_game('dual')
+    actions = []
+    for _ in range(plies):
+        legal = state.get_legal_actions()
+        log_policy, _ = network(torch.from_numpy(state.get_nn_state()).unsqueeze(0),
+                                torch.from_numpy(make_pieces_remaining_vector(state)).unsqueeze(0),
+                                torch.from_numpy(state.get_legal_actions_mask()).unsqueeze(0))
+        logits = log_policy[0].numpy()[legal].astype(np.float64) / temperature
+        probs = np.exp(logits - logits.max())
+        action = legal[rng.choice(len(legal), p=probs / probs.sum())]
+        actions.append(action)
+        state = state.apply_action(action)
+    return actions
+
+
 class RandomBot:
     """Uniform random legal move."""
 
