@@ -36,6 +36,8 @@ def load_network(path: str, device: torch.device) -> Tuple[BlokusNetwork, Dict[s
         num_blocks=net_cfg.get('num_blocks', 5),
         channels=net_cfg.get('channels', 128),
         score_input=score_input,
+        policy_head=net_cfg.get('policy_head', 'linear'),
+        corner_planes=net_cfg.get('corner_planes', False),
     )
     network.load_state_dict(state_dict)
     # Weight decay drives unused weights into subnormal floats (a third of the

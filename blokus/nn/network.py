@@ -17,7 +17,7 @@ import numpy as np
 from typing import Tuple
 
 from blokus.engine.game_state import (
-    BOARD_SIZE, NUM_PIECES, MAX_ORIENTATIONS, NUM_COLORS, ACTION_SPACE_SIZE,
+    BOARD_SIZE, NUM_PIECES, MAX_ORIENTATIONS, NUM_COLORS, ACTION_SPACE_SIZE, load_pieces,
 )
 
 # Input channels: current player, 3 opponents, empty
@@ -33,6 +33,34 @@ PIECE_REMAINING_SIZE = NUM_PIECES * NUM_COLORS  # 84
 SCORE_VECTOR_SIZE = NUM_COLORS  # 4
 MAX_SCORE_PER_COLOR = 89  # 21 pieces = 89 total squares
 
+POLICY_HEADS = ('linear', 'footprint5', 'footprint7')
+
+
+def footprint_masks(halo: int) -> torch.Tensor:
+    """(168, K, K) masks, K = 5 + 2 * halo: the cells each piece x orientation covers,
+    plus with halo=1 every cell touching them. Index [i, j] is the offset
+    (i - halo, j - halo) from the placement anchor (bounding-box top-left)."""
+    size = 5 + 2 * halo
+    masks = torch.zeros(POLICY_CHANNELS, size, size)
+    for pid, piece in enumerate(load_pieces()):
+        for oid, orientation in enumerate(piece.orientations):
+            for r, c in orientation.occupied:
+                for dr in range(-halo, halo + 1):
+                    for dc in range(-halo, halo + 1):
+                        masks[pid * MAX_ORIENTATIONS + oid, r + dr + halo, c + dc + halo] = 1
+    return masks
+
+
+def corner_planes(board_state: torch.Tensor) -> torch.Tensor:
+    """(batch, 4, 20, 20): per color, empty cells that touch it diagonally and not
+    along an edge, where its next piece could go (the opening corner aside)."""
+    colors = board_state[:, :NUM_COLORS]
+    empty = board_state[:, NUM_COLORS:NUM_COLORS + 1]
+    edge = colors.new_tensor([[0, 1, 0], [1, 0, 1], [0, 1, 0]]).expand(NUM_COLORS, 1, 3, 3)
+    diag = colors.new_tensor([[1, 0, 1], [0, 0, 0], [1, 0, 1]]).expand(NUM_COLORS, 1, 3, 3)
+    touches_edge = F.conv2d(colors, edge, padding=1, groups=NUM_COLORS) > 0
+    touches_corner = F.conv2d(colors, diag, padding=1, groups=NUM_COLORS) > 0
+    return (touches_corner & ~touches_edge).float() * empty
 
 
 class ResidualBlock(nn.Module):
@@ -60,18 +88,29 @@ class BlokusNetwork(nn.Module):
         num_blocks: Number of residual blocks in the backbone (default 5).
         channels: Number of filters in the backbone (default 128).
         value_fc_size: Hidden size for the value head FC layer (default 256).
+        policy_head: 'linear' reads each placement's logit from the trunk features
+            at its anchor cell alone (1x1 conv). 'footprint5' adds a 3x3 hidden
+            layer, then sums learned weights over the cells the shape covers;
+            'footprint7' also over the cells touching it.
+        corner_planes: Add 4 input planes of each color's open corner cells,
+            computed from the occupancy planes.
     """
 
     def __init__(self, num_blocks: int = 5, channels: int = 128,
                  value_fc_size: int = 256, value_dropout: float = 0.0,
-                 score_input: bool = False):
+                 score_input: bool = False, policy_head: str = 'linear',
+                 corner_planes: bool = False):
         super().__init__()
+        assert policy_head in POLICY_HEADS, policy_head
         self.num_blocks = num_blocks
         self.channels = channels
         self.score_input = score_input
+        self.policy_head = policy_head
+        self.corner_planes = corner_planes
 
         # --- Backbone ---
-        self.input_conv = nn.Conv2d(INPUT_CHANNELS, channels, 3, padding=1, bias=False)
+        in_channels = INPUT_CHANNELS + (NUM_COLORS if corner_planes else 0)
+        self.input_conv = nn.Conv2d(in_channels, channels, 3, padding=1, bias=False)
         self.input_bn = nn.BatchNorm2d(channels)
         self.res_blocks = nn.ModuleList([
             ResidualBlock(channels) for _ in range(num_blocks)
@@ -79,7 +118,16 @@ class BlokusNetwork(nn.Module):
 
         # --- Policy head (convolutional) ---
         # 1x1 conv to POLICY_CHANNELS (168), giving (batch, 168, 20, 20) = 67,200 logits
-        self.policy_conv = nn.Conv2d(channels, POLICY_CHANNELS, 1, bias=False)
+        if policy_head == 'linear':
+            self.policy_conv = nn.Conv2d(channels, POLICY_CHANNELS, 1, bias=False)
+        else:
+            self.halo = 1 if policy_head == 'footprint7' else 0
+            masks = footprint_masks(self.halo)
+            self.policy_hidden = nn.Sequential(
+                nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(channels), nn.ReLU())
+            self.policy_conv = nn.Conv2d(channels, POLICY_CHANNELS, masks.shape[-1], bias=False)
+            self.register_buffer('policy_mask', masks.unsqueeze(1), persistent=False)
         self.policy_bn = nn.BatchNorm2d(POLICY_CHANNELS)
         # Project piece-remaining info to per-channel bias (84 → 168)
         # This biases each piece×orientation channel based on piece availability
@@ -95,6 +143,14 @@ class BlokusNetwork(nn.Module):
         )
         self.value_dropout = nn.Dropout(p=value_dropout) if value_dropout > 0 else None
         self.value_fc2 = nn.Linear(value_fc_size, 1)
+
+    def footprint_logits(self, h: torch.Tensor) -> torch.Tensor:
+        """(batch, 168, 20, 20) logits whose value at an anchor sums masked weights
+        over the cells that placement covers (and touches, with the halo)."""
+        # Pad right and below (and by the halo all round) so the window at
+        # each anchor starts at the anchor
+        h = F.pad(h, (self.halo, 4 + self.halo, self.halo, 4 + self.halo))
+        return F.conv2d(h, self.policy_conv.weight * self.policy_mask)
 
     def forward(self, board_state: torch.Tensor,
                 pieces_remaining: torch.Tensor,
@@ -117,12 +173,18 @@ class BlokusNetwork(nn.Module):
             value: (batch,) scalar predictions in [-1, 1].
         """
         # Backbone
+        if self.corner_planes:
+            board_state = torch.cat([board_state, corner_planes(board_state)], dim=1)
         x = F.relu(self.input_bn(self.input_conv(board_state)))
         for block in self.res_blocks:
             x = block(x)
 
         # --- Policy head ---
-        p = self.policy_bn(self.policy_conv(x))  # (batch, 168, 20, 20)
+        if self.policy_head == 'linear':
+            p = self.policy_conv(x)
+        else:
+            p = self.footprint_logits(self.policy_hidden(x))
+        p = self.policy_bn(p)  # (batch, 168, 20, 20)
         # Add piece-remaining bias: project 84 → 168, broadcast over spatial dims
         piece_bias = self.policy_pieces_fc(pieces_remaining)  # (batch, 168)
         p = p + piece_bias.unsqueeze(-1).unsqueeze(-1)  # broadcast to (batch, 168, 20, 20)
