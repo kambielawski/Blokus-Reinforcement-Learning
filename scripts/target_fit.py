@@ -3,7 +3,9 @@
 buffer's visit targets on the newest positions, by game phase, plus how saturated
 the value targets are.
 
-Usage: python scripts/target_fit.py RUN_DIR CHECKPOINT
+Usage: python scripts/target_fit.py RUN_DIR CHECKPOINT [COUNT [SKIP]]
+
+COUNT examples (default 30000) ending SKIP examples before the newest.
 """
 import os
 import sys
@@ -25,7 +27,10 @@ net, info = load_network(ckpt, 'cpu')
 print('net iteration', info['iteration'])
 n = len(val); rem = pieces.reshape(n, -1).sum(1)
 rng = np.random.default_rng(0)
-newest = np.arange(n - 30000, n)
+count = int(sys.argv[3]) if len(sys.argv) > 3 else 30000
+skip = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+newest = np.arange(n - skip - count, n - skip)
+print(f'examples {n - skip - count} to {n - skip} of {n}')
 for lo, hi in [(70, 85), (50, 70), (30, 50), (0, 30)]:
     sel = newest[(rem[newest] >= lo) & (rem[newest] < hi)]
     sel = rng.choice(sel, 300, replace=False)
