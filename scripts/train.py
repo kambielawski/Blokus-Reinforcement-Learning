@@ -601,6 +601,8 @@ def _self_play_worker(rank: int, model_state_dict: dict, config: dict,
             margin_scale=config.get('margin_scale', 0.0),
             root_top_k=config.get('root_top_k'),
             dirichlet_alpha=config.get('dirichlet_alpha', 0.3),
+            prune_targets=config.get('prune_targets', False),
+            random_opening_fraction=config.get('random_opening_fraction', 0.0),
         )
         result_queue.put(examples)
 
@@ -663,6 +665,8 @@ def run_self_play_sequential(network: BlokusNetwork, num_games: int,
             margin_scale=cfg['training'].get('margin_scale', 0.0),
             root_top_k=cfg['mcts'].get('root_top_k'),
             dirichlet_alpha=cfg['mcts'].get('dirichlet_alpha', 0.3),
+            prune_targets=cfg['mcts'].get('prune_targets', False),
+            random_opening_fraction=cfg['self_play'].get('random_opening_fraction', 0.0),
         )
         dt = time.time() - t0
         print(f" {len(examples)} examples in {dt:.1f}s")
@@ -1214,6 +1218,8 @@ def main():
         'margin_scale': cfg['training'].get('margin_scale', 0.0),
         'root_top_k': cfg['mcts'].get('root_top_k'),
         'dirichlet_alpha': cfg['mcts'].get('dirichlet_alpha', 0.3),
+        'prune_targets': cfg['mcts'].get('prune_targets', False),
+        'random_opening_fraction': cfg['self_play'].get('random_opening_fraction', 0.0),
     }
 
     num_workers = cfg['self_play']['num_workers']

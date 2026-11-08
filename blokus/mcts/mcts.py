@@ -29,7 +29,7 @@ class MCTSNode:
     """
     __slots__ = [
         'state', 'parent', 'action', 'children',
-        'visit_count', 'total_value', 'prior',
+        'visit_count', 'total_value', 'prior', 'clean_prior',
         'is_expanded', 'is_terminal',
         '_parent_state',  # parent's GameState, for lazy child creation
     ]
@@ -42,6 +42,7 @@ class MCTSNode:
         self.parent = parent
         self.action = action
         self.prior = prior
+        self.clean_prior = prior  # Prior before root noise
         self.children: Dict[int, 'MCTSNode'] = {}
         self.visit_count = 0
         self.total_value = 0.0
@@ -109,7 +110,8 @@ class MCTS:
                  value_scale: float = 1.0,
                  terminal_margin_scale: float = 0.0,
                  root_top_k: Optional[int] = None,
-                 time_limit: Optional[float] = None):
+                 time_limit: Optional[float] = None,
+                 prune_targets: bool = False):
         self.network = network
         self.c_puct = c_puct
         self.num_simulations = num_simulations
@@ -123,6 +125,9 @@ class MCTS:
         self.terminal_margin_scale = terminal_margin_scale
         self.root_top_k = root_top_k
         self.time_limit = time_limit
+        # Training target without the visits root noise forced (see _pruned_policy)
+        self.prune_targets = prune_targets
+        self.last_target: Optional[np.ndarray] = None
         # Filled in by search(): {'sims', 'seconds', 'value', 'children'}
         self.last_stats: Optional[dict] = None
         # Virtual loss magnitude — discourages re-selecting the same leaf
@@ -160,7 +165,9 @@ class MCTS:
             'children': {a: (c.visit_count, -c.mean_value, c.prior)
                          for a, c in root.children.items()},
         }
-        return self._get_policy(root), root.mean_value
+        policy = self._get_policy(root)
+        self.last_target = self._pruned_policy(root) if self.prune_targets else policy
+        return policy, root.mean_value
 
     def select_action(self, state: GameState) -> Tuple[int, np.ndarray, float]:
         """Select an action using MCTS.
@@ -193,7 +200,8 @@ class MCTS:
             idx = np.random.choice(len(legal), p=probs)
             action = legal[idx]
 
-        return action, policy, value
+        # Moves are chosen from the raw visits; the target may be pruned
+        return action, self.last_target, value
 
     # ------------------------------------------------------------------
     # Single-sim path (batch_size <= 1)
@@ -419,6 +427,7 @@ class MCTS:
             priors = priors[top_indices]
             priors /= priors.sum()
 
+        clean = priors
         # Add Dirichlet noise at root (skip if alpha <= 0)
         if add_noise and len(legal) > 0 and self.dirichlet_alpha > 0:
             noise = np.random.dirichlet(
@@ -439,6 +448,7 @@ class MCTS:
                 prior=float(priors[i]),
                 parent_state=state,
             )
+            child.clean_prior = float(clean[i])
             node.children[a] = child
 
     # ------------------------------------------------------------------
@@ -535,6 +545,33 @@ class MCTS:
             else:
                 current.total_value -= value
             current = current.parent
+
+    def _pruned_policy(self, root: MCTSNode) -> np.ndarray:
+        """Visit distribution without the visits root noise forced (as in KataGo).
+
+        A visit to child c, taking it from k - 1 to k visits, is kept only if c's
+        PUCT score at k - 1 visits, computed with its noise-free prior, reaches the
+        most visited child's final score. Children left with one visit or none are
+        dropped, with or without noise.
+        """
+        children = [c for a, c in root.children.items() if a >= 0 and c.visit_count > 0]
+        policy = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
+        if not children:
+            return policy
+        sqrt_n = math.sqrt(root.visit_count)
+        best = max(children, key=lambda c: (c.visit_count, -c.mean_value))
+        best_score = (-best.mean_value
+                      + self.c_puct * best.clean_prior * sqrt_n / (1 + best.visit_count))
+        for child in children:
+            visits = child.visit_count
+            if child is not best:
+                gap = best_score - (-child.mean_value)
+                if gap > 0:
+                    visits = min(visits, int(self.c_puct * child.clean_prior * sqrt_n / gap))
+                if visits <= 1:
+                    visits = 0
+            policy[child.action] = visits
+        return policy / policy.sum()
 
     def _get_policy(self, root: MCTSNode) -> np.ndarray:
         """Extract visit count distribution from root node."""

@@ -16,6 +16,7 @@ from blokus.nn.network import (
     BlokusNetwork, make_pieces_remaining_vector, make_score_vector,
 )
 from blokus.mcts.mcts import MCTS
+from blokus.agents.bots import random_opening
 
 
 @dataclass
@@ -60,7 +61,8 @@ class AlphaZeroAgent:
                  device: Optional[torch.device] = None,
                  top_k_actions: int = 0,
                  root_top_k: Optional[int] = None,
-                 terminal_margin_scale: float = 0.0):
+                 terminal_margin_scale: float = 0.0,
+                 prune_targets: bool = False):
         self.network = network
         self.device = device or torch.device('cpu')
         self.mcts = MCTS(
@@ -74,6 +76,7 @@ class AlphaZeroAgent:
             top_k_actions=top_k_actions,
             root_top_k=root_top_k,
             terminal_margin_scale=terminal_margin_scale,
+            prune_targets=prune_targets,
         )
 
     def select_action(self, state: GameState) -> Tuple[int, np.ndarray]:
@@ -107,6 +110,8 @@ def self_play_game(network: BlokusNetwork,
                    margin_scale: float = 0.0,
                    root_top_k: Optional[int] = None,
                    dirichlet_alpha: float = 0.3,
+                   prune_targets: bool = False,
+                   random_opening_fraction: float = 0.0,
                    ) -> List[TrainingExample]:
     """Play a complete self-play game and collect training examples.
 
@@ -126,6 +131,10 @@ def self_play_game(network: BlokusNetwork,
             also used for terminal nodes in search. 0 = win/loss.
         root_top_k: Children kept at the root (see MCTS).
         dirichlet_alpha: Root noise concentration.
+        prune_targets: Drop the visits root noise forced from policy targets.
+        random_opening_fraction: Share of games that start from a random
+            pentomino in each corner (bots.random_opening), as ladder games do.
+            Those plies are not recorded, and temperature counts from after them.
 
     Returns:
         List of TrainingExample objects for training.
@@ -141,9 +150,13 @@ def self_play_game(network: BlokusNetwork,
         root_top_k=root_top_k,
         terminal_margin_scale=margin_scale,
         dirichlet_alpha=dirichlet_alpha,
+        prune_targets=prune_targets,
     )
 
     state = GameState.new_game(game_mode)
+    if random_opening_fraction > 0 and np.random.random() < random_opening_fraction:
+        for action in random_opening(int(np.random.randint(2 ** 31))):
+            state = state.apply_action(action)
 
     # Collect (state_data, policy, agent_idx, score_vec) during play
     game_history: List[Tuple] = []
