@@ -15,3 +15,10 @@ export WANDB_MODE="${WANDB_MODE:-offline}"
 blokus_modules() {
     module load uv/0.9.18 python/3.13.2
 }
+
+# The user quota on scratch is shared with other data (1 TB, met at 992 GB of
+# du usage on 2026-11-08). train.py skips a save that would not fit, using the
+# usage that usage_probe.sh records.
+export BLOKUS_USER_SCRATCH="/cluster/scratch/$USER"
+export BLOKUS_QUOTA_BYTES="1000000000000"
+export BLOKUS_USAGE_FILE="$BLOKUS_SCRATCH/.usage.json"

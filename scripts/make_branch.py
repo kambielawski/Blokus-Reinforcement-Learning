@@ -2,7 +2,9 @@
 """Seed a new run directory from a parent checkpoint and its replay buffer.
 
 The branch resumes from the parent with train.sbatch (it finds checkpoint_latest.pt)
-but starts its own W&B run. With --rescale-margin, value targets stored as
+but starts its own W&B run. The buffer is written as train.py now saves them
+(0/1 planes as uint8, compressed), about 25x smaller than a float32 copy. With
+--rescale-margin, value targets stored as
 tanh(margin / FROM) are rewritten as tanh(margin / TO), so a branch with a new
 margin_scale does not train on the old scale for a whole buffer window. Targets at
 |v| = 1 in float32 (margin beyond about 9 * FROM) stay at +-1 under any scale.
@@ -13,7 +15,6 @@ Usage: python scripts/make_branch.py --checkpoint P.pt --buffer-dir DIR --out RU
 
 import argparse
 import os
-import shutil
 
 import numpy as np
 import torch
@@ -35,17 +36,18 @@ def main():
 
     src = os.path.join(args.buffer_dir, 'replay_buffer.npz')
     dst = os.path.join(args.out, 'replay_buffer.npz')
+    data = dict(np.load(src))
+    for key in ('board_states', 'pieces_remaining'):
+        if data[key].dtype == np.float32 and np.all((data[key] == 0) | (data[key] == 1)):
+            data[key] = data[key].astype(np.uint8)
     if args.rescale_margin:
         old, new = args.rescale_margin
-        data = dict(np.load(src))
         v = data['value_targets'].astype(np.float64)
         margin = old * np.arctanh(np.clip(v, -1 + 1e-7, 1 - 1e-7))
         data['value_targets'] = np.tanh(margin / new).astype(np.float32)
-        np.savez(dst, **data)
         print(f'value targets rescaled {old:g} -> {new:g}: std {v.std():.3f} -> '
               f'{data["value_targets"].std():.3f}')
-    else:
-        shutil.copyfile(src, dst)
+    np.savez_compressed(dst, **data)
     print(f'branch of iteration {ckpt["iteration"]} written to {args.out}')
 
 

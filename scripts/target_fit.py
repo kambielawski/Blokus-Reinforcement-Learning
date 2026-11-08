@@ -40,7 +40,7 @@ for lo, hi in [(70, 85), (50, 70), (30, 50), (0, 30)]:
         mask = np.zeros((len(ch), ACTION_SPACE_SIZE), np.float32)
         for j, i in enumerate(ch): mask[j, idxs[off[i]:off[i + 1]]] = 1
         with torch.no_grad():
-            lp, v = net(torch.from_numpy(boards[ch]), torch.from_numpy(pieces[ch]), torch.from_numpy(mask))
+            lp, v = net(torch.from_numpy(boards[ch].astype(np.float32)), torch.from_numpy(pieces[ch].astype(np.float32)), torch.from_numpy(mask))
         lp = lp.numpy(); v = v.numpy().ravel()
         for j, i in enumerate(ch):
             a = idxs[off[i]:off[i + 1]]; t = pol[off[i]:off[i + 1]].astype(np.float64); t /= t.sum()

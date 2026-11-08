@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import glob
+import json
 import math
 import os
 import random
@@ -125,6 +126,43 @@ def apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> None:
 # Checkpointing
 # ---------------------------------------------------------------------------
 
+# Scratch is shared with other data under one user quota. When it fills, every
+# write fails, so a save that would not fit is skipped rather than attempted.
+# BLOKUS_QUOTA_BYTES is the limit; BLOKUS_USAGE_FILE is kept current by
+# slurm/tufts/usage_probe.sh. Without either, saves are simply attempted.
+USAGE_MAX_AGE = 3600
+
+
+def quota_headroom() -> Optional[int]:
+    """Bytes left under the user quota, or None when not known."""
+    limit, path = os.environ.get('BLOKUS_QUOTA_BYTES'), os.environ.get('BLOKUS_USAGE_FILE')
+    if not limit or not path:
+        return None
+    try:
+        with open(path) as f:
+            usage = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if time.time() - usage['time'] > USAGE_MAX_AGE:
+        return None
+    return int(float(limit)) - int(usage['bytes'])
+
+
+def _remove_quietly(*paths: str) -> None:
+    for path in paths:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _binary_as_uint8(array: np.ndarray) -> np.ndarray:
+    """0/1 planes stored as bytes, 4x smaller; ReplayBuffer.load_state_dict casts back."""
+    if array.dtype == np.float32 and np.all((array == 0) | (array == 1)):
+        return array.astype(np.uint8)
+    return array
+
+
 def _atomic_torch_save(payload: Dict[str, Any], path: str) -> None:
     """Write a checkpoint so a kill mid-save leaves the previous file intact."""
     temp_path = f'{path}.tmp'
@@ -166,23 +204,26 @@ class CheckpointManager:
             **meta,
         }
 
-        # Always save as 'latest'
+        # Always save as 'latest', then the numbered checkpoint
         latest_path = os.path.join(self.save_dir, 'checkpoint_latest.pt')
-        _atomic_torch_save(payload, latest_path)
-
-        # Save numbered checkpoint
         iter_path = os.path.join(self.save_dir, f'checkpoint_{iteration:04d}.pt')
-        _atomic_torch_save(payload, iter_path)
+        try:
+            _atomic_torch_save(payload, latest_path)
+            _atomic_torch_save(payload, iter_path)
+        except OSError as err:
+            _remove_quietly(f'{latest_path}.tmp', f'{iter_path}.tmp')
+            print(f"  !!! CHECKPOINT NOT SAVED at iteration {iteration}: {err}. "
+                  f"Training continues; the previous checkpoint is intact.", flush=True)
+            return None
 
-        # Save replay buffer separately using np.savez (streams arrays to
-        # disk without pickle).
+        # Save replay buffer separately (compressed npz, no pickle)
         if replay_state is not None:
             buf_path = os.path.join(self.save_dir, 'replay_buffer.npz')
             save_kwargs = {
                 'max_size': np.array(replay_state['max_size']),
                 'size': np.array(replay_state['size']),
-                'board_states': replay_state['board_states'],
-                'pieces_remaining': replay_state['pieces_remaining'],
+                'board_states': _binary_as_uint8(replay_state['board_states']),
+                'pieces_remaining': _binary_as_uint8(replay_state['pieces_remaining']),
                 'value_targets': replay_state['value_targets'],
             }
             if 'policy_weights' in replay_state:
@@ -197,8 +238,22 @@ class CheckpointManager:
                 save_kwargs['policy_targets'] = replay_state['policy_targets']
             # A kill during a save must not destroy the previous buffer
             temp_path = os.path.join(self.save_dir, 'replay_buffer.tmp.npz')
-            np.savez(temp_path, **save_kwargs)
-            os.replace(temp_path, buf_path)
+            # Twice the last save's size, or the uncompressed size for a first save
+            last = os.path.getsize(buf_path) if os.path.exists(buf_path) else None
+            need = 2 * (last or sum(v.nbytes for v in save_kwargs.values()))
+            headroom = quota_headroom()
+            if headroom is not None and headroom < need:
+                print(f"  !!! REPLAY BUFFER NOT SAVED at iteration {iteration}: quota headroom "
+                      f"{headroom / 1e9:.1f} GB is under {need / 1e9:.1f} GB. The buffer on "
+                      f"disk is from an earlier iteration.", flush=True)
+            else:
+                try:
+                    np.savez_compressed(temp_path, **save_kwargs)
+                    os.replace(temp_path, buf_path)
+                except OSError as err:
+                    _remove_quietly(temp_path)
+                    print(f"  !!! REPLAY BUFFER NOT SAVED at iteration {iteration}: {err}. "
+                          f"The buffer on disk is from an earlier iteration.", flush=True)
 
         return iter_path
 

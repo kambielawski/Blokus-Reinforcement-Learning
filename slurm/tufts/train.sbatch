@@ -11,8 +11,9 @@
 #
 #SBATCH --job-name=blokus-train
 #SBATCH --gres=gpu:1
-# RTX PRO 6000 (Blackwell, sm_120) needs a newer torch than our cu126 build
-#SBATCH --exclude=pax[186-187]
+# RTX PRO 6000 (Blackwell, sm_120) needs a newer torch than our cu126 build;
+# pax063's GPU reported busy or unavailable twice on 2026-11-08
+#SBATCH --exclude=pax[063,186-187]
 # Self-play is CPU-bound: 10b ran 1207 games/hr on a Sapphire Rapids node, 677 on Ice Lake
 #SBATCH --prefer=sapphirerapids
 #SBATCH --cpus-per-task=28
@@ -45,6 +46,10 @@ elif [ -n "${INIT:-}" ]; then
 fi
 [ -n "${SEED:-}" ] && ARGS+=(--seed "$SEED")
 
+# Keep the quota guard's usage reading fresh while training runs
+( while true; do bash slurm/tufts/usage_probe.sh; sleep 900; done ) &
+PROBE_PID=$!
+
 # In the background so bash can act on the signal while Python runs.
 python -u scripts/train.py "${ARGS[@]}" &
 TRAIN_PID=$!
@@ -56,6 +61,7 @@ while kill -0 "$TRAIN_PID" 2>/dev/null; do
     wait "$TRAIN_PID"
     STATUS=$?
 done
+kill "$PROBE_PID" 2>/dev/null
 echo "train.py exited with status $STATUS at $(date)"
 
 if [ "$STATUS" -eq 85 ]; then
