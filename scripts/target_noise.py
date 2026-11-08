@@ -146,6 +146,8 @@ def main():
                         help='Also play this many self-play games and sample from them')
     parser.add_argument('--per-phase', type=int, default=300)
     parser.add_argument('--sims', type=int, default=None, help='Default: the checkpoint config')
+    parser.add_argument('--dirichlet-epsilon', type=float, default=None,
+                        help='Override the root noise weight (0 turns root noise off)')
     parser.add_argument('--workers', type=int, default=8)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--out', required=True)
@@ -157,6 +159,8 @@ def main():
            'dirichlet_epsilon': m['dirichlet_epsilon'], 'batch_size': m.get('batch_size', 8),
            'top_k_actions': m.get('top_k_actions', 0), 'root_top_k': m.get('root_top_k'),
            'margin_scale': info['training'].get('margin_scale', 0.0)}
+    if args.dirichlet_epsilon is not None:
+        cfg['dirichlet_epsilon'] = args.dirichlet_epsilon
     sims = args.sims or m['num_simulations']
     print(f'sims {sims}, settings {cfg}', flush=True)
 
